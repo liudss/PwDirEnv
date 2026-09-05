@@ -168,5 +168,31 @@ key 不合规或无 `=` 的行静默跳过；**不做** command substitution 与
 | M3 | Diff + Export（大小写不敏感 diff、`pwdir export --format json`） | ✅ |
 | M4 | PowerShell Module + Hook（Enable/Disable/hook、apply/restore） | ✅ |
 | M5 | stdlib（PATH_add / dotenv / watch_file / source_env / source_up） | ✅ |
-| M6 | Cache + Reload（fingerprint 快速路径） | pending |
+| M6 | Cache + Reload（fingerprint 快速路径） | ✅ |
 | M7 | exec + doctor + 打包 | pending |
+
+## Cache 与快速路径（M6）
+
+每次 hook，module 都调用 `pwdir export`（native 进程，不 spawn pwsh）；core 依据磁盘 cache
+判定指纹是否未变（SPEC §12/§22）：
+
+- **快速路径**：RC 未变且未传 `--force` 时，若磁盘 cache（`%LOCALAPPDATA%\PwDirEnv\cache\`）
+  中的指纹仍与当前现实一致 → 直接返回 `Noop`（`patch` 为空、`fingerprint` 携带缓存指纹、
+  diagnostics 含 `fingerprint unchanged (fast path)`），**不 spawn evaluator**。
+  实测稳态单次 export ≈ 20-30 ms（含 pwdir.exe 进程启动），evaluator 冷启动约 500-600 ms。
+- **指纹组成**（`Fingerprint`）：RC 内容 SHA-256（内容级，与 trust 同源，不依赖 mtime）；
+  `source_env`/`source_up` 的 sourced 文件 size+mtime；`watch_file`/`watch_dir` 注册的
+  watch 目标 size+mtime（`watch_states`，与 `watches` 按下标对齐）；嵌入 bootstrap/stdlib
+  的内容 SHA-256（脚本行为变化即全量失效）。任一项状态获取失败（文件消失等）一律按
+  「已变化」降级为重新评估 —— 宁可多评估一次，绝不漏掉一次变化。
+- **force 语义**：`pwdir export --force` 跳过快速路径强制评估。cache 是跨会话共享的，
+  module 在「rc 与 `ActiveRc` 不一致」（新 shell 首次进入 / 切换目录）时必须传 force，
+  否则 core 会命中上一个会话留下的有效 cache 返回空 patch 而漏掉加载。
+- **reload**：`pwdir reload` 使当前 RC 的 cache 失效（幂等删除），下一次 export 强制重评估；
+  找不到 RC 时输出 `nothing to reload` 并成功退出。
+- **cache 不存环境变量值**（SPEC §12.4 的保守选择，ADR 取舍）：条目只含 schema、rc 路径、
+  指纹与评估时间戳。环境变量值可能含 secrets，持久化到磁盘会扩大泄漏面；新 shell 首次
+  进入由 module 传 force 强制重评估，天然拿到完整环境。写入采用「临时文件 + rename」
+  原子替换（与 trust store 同源），损坏 / 未识别 schema 的条目按未命中安全降级。
+- **状态**：`pwdir status [--json]` 新增 `cache_status`（`none` = 无条目；`fresh` = 指纹与
+  当前现实一致；`stale` = 有条目但已失效）。status 只读呈现，不评估、不写 cache。

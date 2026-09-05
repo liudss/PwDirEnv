@@ -97,9 +97,14 @@ function Get-PwDirCurrentFileSystemPath {
 function Invoke-PwDirNative {
     <#
         执行 `pwdir export --format json`，返回解析后的 ExportOutput 对象。
+        -Force 透传 `--force`：跳过 core 的 fingerprint 快速路径强制评估 ——
+        rc 与 ActiveRc 不一致（新 shell 首次进入 / 切换目录）时必须传，
+        否则 core 会命中其他会话留下的有效 cache 返回空 patch 而漏掉加载（M6）。
         stdout 是 pretty-print 多行 JSON，整体拼接后一次性 ConvertFrom-Json（SPEC §15.1：parse，绝不执行）；
         stderr 仅记录到 LastStderr 用于诊断。基础设施故障（exe 缺失 / 无输出）抛异常，由 hook 的 catch 兜底。
     #>
+    param([switch]$Force)
+
     $exe = $script:PwDirState.PwDirExe
     if ([string]::IsNullOrEmpty($exe) -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) {
         throw "pwdir.exe is missing at '$exe'. Install or set -PwDirPath / `$env:PWDIRENV_EXE."
@@ -113,7 +118,9 @@ function Invoke-PwDirNative {
     $ErrorActionPreference = 'Continue'
     if ($nativeVar) { $PSNativeCommandUseErrorActionPreference = $false }
     try {
-        $output = & $exe export --format json 2>&1
+        $nativeArgs = @('export', '--format', 'json')
+        if ($Force) { $nativeArgs += '--force' }
+        $output = & $exe @nativeArgs 2>&1
     }
     finally {
         $ErrorActionPreference = $savedEap
@@ -361,7 +368,9 @@ function Invoke-PwDirEnvHook {
 
     .DESCRIPTION
         Host 从不下钻执行 RC —— 评估一律发生在 pwdir.exe 的隔离子进程，本函数只应用
-        返回的结构化 patch（SPEC §15）。错误绝不破坏 prompt（SPEC §13.4）：
+        返回的结构化 patch（SPEC §15）。每次 prompt 都调用 native export：core 依据
+        磁盘 fingerprint cache 判定无变化时返回空 patch（快速路径，不 spawn pwsh，M6）；
+        rc 与 ActiveRc 不一致时传 --force 强制评估。错误绝不破坏 prompt（SPEC §13.4）：
         catch 一切、只记录、保留最后成功环境。
     #>
     [CmdletBinding()]
@@ -383,17 +392,28 @@ function Invoke-PwDirEnvHook {
 
         $result = Invoke-PwDirNative
         $newRc = $result.rc
-        $rcChanged = ($newRc -ne $script:PwDirState.ActiveRc)
+        $oldRc = $script:PwDirState.ActiveRc
+        $rcChanged = ($newRc -ne $oldRc)
 
-        if ($rcChanged -and $null -ne $script:PwDirState.ActiveRc) {
+        if ($rcChanged) {
             # rc 变化（SPEC §8.4 恢复时机）：先按旧 rc 的 baseline 恢复到干净 Host 环境，
             # 再基于该干净环境重新 export 新 rc —— 保证新 rc 的 diff/_baseline 都以真实环境为准
-            $oldRc = $script:PwDirState.ActiveRc
-            Restore-PwDirEnvironment
-            Write-PwDirLog info "unloading $oldRc"
+            if ($null -ne $oldRc) {
+                Restore-PwDirEnvironment
+                Write-PwDirLog info "unloading $oldRc"
+            }
             if ($null -ne $newRc) {
-                $result = Invoke-PwDirNative
-                $newRc = $result.rc
+                # M6 force 语义：cache 跨会话共享，rc 与 ActiveRc 不一致（新 shell 首次进入 /
+                # 切换目录）时必须强制评估，否则 core 会命中有效 cache 返回空 patch 而漏掉加载。
+                # - 恢复过旧环境（oldRc 非 null）→ 必须重 export（diff 基准已变）；
+                # - 首次进入（oldRc 为 null）且首次 export 已完整评估（action=apply，
+                #   baseline 即当前干净环境）→ 直接应用，避免重复 spawn；
+                #   action=noop（含快速路径命中）→ 补一次 force 确保真实加载。
+                $needsForcedExport = ($null -ne $oldRc) -or ($result.action -eq 'noop')
+                if ($needsForcedExport) {
+                    $result = Invoke-PwDirNative -Force
+                    $newRc = $result.rc
+                }
             }
         }
         if ($null -eq $newRc) { return }   # 无 rc：环境已处于 baseline，无事可做
@@ -405,7 +425,12 @@ function Invoke-PwDirEnvHook {
                 Write-PwDirExportSummary $result
             }
             'noop' {
-                if ($rcChanged) { Write-PwDirLog info "loading $newRc" }
+                if ($rcChanged) {
+                    Write-PwDirLog info "loading $newRc"
+                    # noop 无 managed keys 可应用，但必须记录 ActiveRc —— 否则后续每次
+                    # prompt 都判定 rc 变化并强制重评估，空 diff rc 的快速路径稳态无法形成
+                    $script:PwDirState.ActiveRc = $newRc
+                }
             }
             'error' {
                 # last-known-good（SPEC §20.2）：同一项目内失败 → 保留上次成功环境；

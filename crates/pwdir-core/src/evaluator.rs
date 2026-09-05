@@ -15,6 +15,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +31,22 @@ use crate::PwDirError;
 const BOOTSTRAP_PS1: &str = include_str!("../../../evaluator/bootstrap.ps1");
 /// stdlib.ps1（M5 前为骨架，但必须可被 bootstrap dot-source）。
 const STDLIB_PS1: &str = include_str!("../../../evaluator/stdlib.ps1");
+
+/// 嵌入脚本版本指纹（M6）：bootstrap / stdlib 内容的 SHA-256，进程内只算一次。
+///
+/// 脚本内容的任何变化（= evaluator 行为可能变化）都必须使全部 cache 失效，
+/// 因此版本号直接取内容 hash 而非手工维护的版本字符串。
+static SCRIPT_VERSIONS: LazyLock<(String, String)> = LazyLock::new(|| {
+    (
+        crate::trust::sha256_hex(BOOTSTRAP_PS1.as_bytes()),
+        crate::trust::sha256_hex(STDLIB_PS1.as_bytes()),
+    )
+});
+
+/// 返回 `(bootstrap_sha256_hex, stdlib_sha256_hex)`（M6 fingerprint 的版本分量）。
+pub fn embedded_script_versions() -> (String, String) {
+    SCRIPT_VERSIONS.clone()
+}
 
 /// evaluator 启动配置。默认值对齐 SPEC §7.2/§7.6。
 #[derive(Debug, Clone)]
@@ -326,6 +343,18 @@ mod tests {
     use std::ffi::OsString;
 
     use pwdir_protocol::WatchDependency;
+
+    #[test]
+    fn embedded_script_versions_are_stable_sha256_hex() {
+        let (bootstrap, stdlib) = embedded_script_versions();
+        assert_eq!(bootstrap.len(), 64);
+        assert_eq!(stdlib.len(), 64);
+        assert!(bootstrap.chars().all(|c| c.is_ascii_hexdigit()));
+        // bootstrap 与 stdlib 是不同文件，hash 不应相同
+        assert_ne!(bootstrap, stdlib);
+        // 嵌入内容不变则版本稳定；两次调用取同一缓存值
+        assert_eq!(embedded_script_versions(), (bootstrap, stdlib));
+    }
 
     #[test]
     fn default_config_matches_spec() {

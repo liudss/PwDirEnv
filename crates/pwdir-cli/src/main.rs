@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
+use pwdir_core::cache::CacheStore;
 use pwdir_core::dirs;
 use pwdir_core::discovery;
 use pwdir_core::evaluator::EvaluatorConfig;
+use pwdir_core::fingerprint::fingerprint_is_current;
 use pwdir_core::trust::{self, TrustStore};
 use pwdir_core::PwDirError;
 use pwdir_protocol::DiscoveredRc;
@@ -57,6 +59,9 @@ enum Commands {
         /// Output format
         #[arg(long, default_value = "json")]
         format: String,
+        /// Skip the fingerprint fast path and force a full evaluation (M6)
+        #[arg(long)]
+        force: bool,
     },
     /// Print the shell hook bootstrap snippet
     Hook {
@@ -104,14 +109,14 @@ fn run() -> Result<i32> {
     };
 
     match command {
-        // M3：export 走 pwdir-core::export 编排（SPEC §14.7 协议入口）
-        Commands::Export { format } => {
+        // M3/M6：export 走 pwdir-core::export 编排（SPEC §14.7 协议入口，含 fingerprint 快速路径）
+        Commands::Export { format, force } => {
             if format != "json" {
                 anyhow::bail!("unsupported export format: {format} (only 'json' is supported)");
             }
             // cwd 不可用（当前目录被删除）时传空路径：export 返回 Noop + diagnostic，不 panic（SPEC §20.4）
             let cwd = discovery::current_dir_fs_or_none().unwrap_or_default();
-            let output = pwdir_core::export::export(&cwd, &EvaluatorConfig::default())?;
+            let output = pwdir_core::export::export(&cwd, &EvaluatorConfig::default(), force)?;
             // blocked / error 是协议语义（module 按 JSON 里的 action 分流），仍输出 JSON 并 exit 0；
             // 只有 export 返回 Err（基础设施故障）才走退出码映射
             println!("{}", serde_json::to_string_pretty(&output)?);
@@ -121,8 +126,8 @@ fn run() -> Result<i32> {
         Commands::Allow { path } => Ok(cmd_allow(path.as_deref())?),
         Commands::Deny { path } => Ok(cmd_deny(path.as_deref())?),
         Commands::Status { json } => Ok(cmd_status(json)?),
-        // TODO(M6): fingerprint 快速路径失效
-        Commands::Reload => Err(anyhow::anyhow!("not implemented yet (milestone 6)")),
+        // M6：使当前 RC 的 fingerprint cache 失效（SPEC §14.4）
+        Commands::Reload => Ok(cmd_reload()?),
         // TODO(M7): argv-safe exec
         Commands::Exec { .. } => Err(anyhow::anyhow!("not implemented yet (milestone 7)")),
         // TODO(M4): hook bootstrap 输出
@@ -198,6 +203,29 @@ fn cmd_deny(path: Option<&Path>) -> Result<i32, PwDirError> {
     Ok(0)
 }
 
+/// `pwdir reload`（M6，SPEC §14.4）：使当前 RC 的 fingerprint cache 失效，
+/// 下一次 hook/export 强制 evaluator。找不到 RC → 提示并成功退出（与 deny 同语义）。
+fn cmd_reload() -> Result<i32, PwDirError> {
+    let cwd = match discovery::current_dir_fs_or_none() {
+        Some(cwd) => cwd,
+        None => {
+            println!("pwdir: nothing to reload");
+            return Ok(0);
+        }
+    };
+    let rc = match discovery::find_rc(&cwd)? {
+        Some(rc) => rc,
+        None => {
+            println!("pwdir: nothing to reload");
+            return Ok(0);
+        }
+    };
+    let cache = CacheStore::open()?;
+    cache.invalidate(&rc.rc_path)?;
+    println!("pwdir: reloaded cache for {}", rc.rc_path.display());
+    Ok(0)
+}
+
 fn cmd_status(json: bool) -> Result<i32, PwDirError> {
     let cwd = discovery::current_dir_fs_or_none();
     // 发现失败（IO）不视为 status 失败：按"无 RC"呈现（SPEC §14.3，status 不做 evaluation）
@@ -223,6 +251,27 @@ fn cmd_status(json: bool) -> Result<i32, PwDirError> {
         }
     };
 
+    // cache 三态（M6，SPEC §14.3）：none = 无条目；fresh = 指纹与当前现实一致；
+    // stale = 有条目但指纹已失效（rc/watch/sourced/脚本版本任一变化）。
+    // status 不评估、不写 cache；cache 子系统不可用时降级为 none（best-effort 呈现）。
+    let cache_status = match &discovered {
+        None => "none".to_string(),
+        Some(rc) => match dirs::cache_dir() {
+            Err(_) => "none".to_string(),
+            Ok(dir) => match CacheStore::new(dir).load(&rc.rc_path) {
+                Ok(None) => "none".to_string(),
+                Ok(Some(entry)) => {
+                    if fingerprint_is_current(&entry.fingerprint, &rc.rc_path) {
+                        "fresh".to_string()
+                    } else {
+                        "stale".to_string()
+                    }
+                }
+                Err(_) => "none".to_string(),
+            },
+        },
+    };
+
     let dirs_root = dirs::pwdir_data_root().ok();
 
     if json {
@@ -231,6 +280,7 @@ fn cmd_status(json: bool) -> Result<i32, PwDirError> {
             "discovered_rc": discovered,
             "trust_status": trust_status,
             "rc_sha256": rc_sha256,
+            "cache_status": cache_status,
             "dirs": dirs_root.map(|root| serde_json::json!({
                 "allow": root.join("allow"),
                 "cache": root.join("cache"),
@@ -257,6 +307,7 @@ fn cmd_status(json: bool) -> Result<i32, PwDirError> {
             "pwdir: rc sha256:       {}",
             rc_sha256.as_deref().unwrap_or("(none)")
         );
+        println!("pwdir: cache status:    {cache_status}");
         match &dirs_root {
             Some(root) => {
                 println!("pwdir: storage allow:   {}", root.join("allow").display());

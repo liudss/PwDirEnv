@@ -235,6 +235,12 @@ pub struct Fingerprint {
     pub rc_sha256: String,
     pub sourced_files: Vec<FileFingerprint>,
     pub watches: Vec<WatchDependency>,
+    /// watched 文件/目录在 evaluate 时点的 size+mtime 快照（M6，与 `watches` 按下标对齐）。
+    /// 快速路径据此做廉价判变，不必重新 evaluate；`#[serde(default)]` 保证旧 JSON 兼容。
+    /// watch 目标允许尚不存在（stdlib 语义），不存在时以 size=0 + modified=None 的
+    /// 「缺失哨兵」占位，使「评估时不存在、检查时仍不存在」稳定判为未变。
+    #[serde(default)]
+    pub watch_states: Vec<FileFingerprint>,
     pub evaluator_version: String,
     pub stdlib_version: String,
 }
@@ -472,5 +478,54 @@ mod tests {
         );
         let back: EvaluationError = serde_json::from_value(value).unwrap();
         assert_eq!(back, error);
+    }
+
+    #[test]
+    fn fingerprint_round_trips_with_watch_states() {
+        let fingerprint = Fingerprint {
+            rc_sha256: "a".repeat(64),
+            sourced_files: vec![FileFingerprint {
+                path: PathBuf::from(r"C:\src\common\.envrc.ps1"),
+                size: 42,
+                modified: Some(std::time::UNIX_EPOCH),
+            }],
+            watches: vec![WatchDependency::File(PathBuf::from(
+                r"C:\src\app\package.json",
+            ))],
+            watch_states: vec![FileFingerprint {
+                path: PathBuf::from(r"C:\src\app\package.json"),
+                size: 7,
+                modified: None,
+            }],
+            evaluator_version: "bootstrap-sha".to_string(),
+            stdlib_version: "stdlib-sha".to_string(),
+        };
+
+        let value = serde_json::to_value(&fingerprint).unwrap();
+        assert_eq!(value["watch_states"][0]["size"], json!(7));
+        assert_eq!(
+            value["watch_states"][0]["path"],
+            json!(r"C:\src\app\package.json")
+        );
+
+        let back: Fingerprint = serde_json::from_value(value).unwrap();
+        assert_eq!(back, fingerprint);
+    }
+
+    #[test]
+    fn fingerprint_deserializes_legacy_json_without_watch_states() {
+        // M6 前的 JSON 没有 watch_states：#[serde(default)] 兜底为空 Vec，
+        // 旧 cache/协议载荷反序列化不报错（由 core 侧把空 watch_states 视为「已变化」）
+        let legacy = json!({
+            "rc_sha256": "abc",
+            "sourced_files": [],
+            "watches": [{"kind": "file", "path": r"C:\x\p.json"}],
+            "evaluator_version": "e",
+            "stdlib_version": "s"
+        });
+        let back: Fingerprint = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.rc_sha256, "abc");
+        assert!(back.watch_states.is_empty());
+        assert_eq!(back.watches.len(), 1);
     }
 }

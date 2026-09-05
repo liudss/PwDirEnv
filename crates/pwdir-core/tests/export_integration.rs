@@ -9,6 +9,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use pwdir_core::cache::CacheStore;
 use pwdir_core::evaluator::EvaluatorConfig;
 use pwdir_core::export::export_with_store;
 use pwdir_core::trust::TrustStore;
@@ -39,11 +40,12 @@ fn config() -> EvaluatorConfig {
     }
 }
 
-/// 注入临时 allow 目录的 store，不碰真实 LOCALAPPDATA。
-fn temp_store() -> (TrustStore, tempfile::TempDir) {
+/// 注入临时 allow/cache 目录的 store 对，不碰真实 LOCALAPPDATA。
+fn temp_stores() -> (TrustStore, CacheStore, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = TrustStore::new(tmp.path().join("allow"));
-    (store, tmp)
+    let cache = CacheStore::new(tmp.path().join("cache"));
+    (store, cache, tmp)
 }
 
 /// 写入 `.envrc.ps1` 并 allow，返回 rc 路径。
@@ -62,7 +64,7 @@ fn set_and_unset_in_one_rc_produce_respective_patch_sides() {
     std::env::set_var(TO_REMOVE, "1");
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (store, _allow) = temp_store();
+    let (store, cache, _guard) = temp_stores();
     let _rc = write_and_allow(
         &store,
         tmp.path(),
@@ -71,7 +73,8 @@ fn set_and_unset_in_one_rc_produce_respective_patch_sides() {
         ),
     );
 
-    let out = export_with_store(tmp.path(), &config(), &store).expect("export must not return Err");
+    let out = export_with_store(tmp.path(), &config(), &store, &cache, false)
+        .expect("export must not return Err");
 
     // 先恢复测试进程环境，再做断言（断言失败也不残留）
     std::env::remove_var(TO_REMOVE);
@@ -106,10 +109,11 @@ fn execution_policy_artifact_is_not_reported_as_new_var() {
     // 保证 baseline 里没有 FOO，set 语义确定
     std::env::remove_var("FOO");
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (store, _allow) = temp_store();
+    let (store, cache, _guard) = temp_stores();
     let _rc = write_and_allow(&store, tmp.path(), "$env:FOO = 'bar'");
 
-    let out = export_with_store(tmp.path(), &config(), &store).expect("export must not return Err");
+    let out = export_with_store(tmp.path(), &config(), &store, &cache, false)
+        .expect("export must not return Err");
     std::env::remove_var("FOO");
 
     assert_eq!(out.action, Action::Apply);
@@ -146,14 +150,15 @@ fn unicode_value_survives_export_round_trip() {
     ensure_pwsh();
     std::env::remove_var("PWDIR_TEST_UNICODE_VAR");
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (store, _allow) = temp_store();
+    let (store, cache, _guard) = temp_stores();
     let _rc = write_and_allow(
         &store,
         tmp.path(),
         "$env:PWDIR_TEST_UNICODE_VAR = '你好 🎉'",
     );
 
-    let out = export_with_store(tmp.path(), &config(), &store).expect("export must not return Err");
+    let out = export_with_store(tmp.path(), &config(), &store, &cache, false)
+        .expect("export must not return Err");
     std::env::remove_var("PWDIR_TEST_UNICODE_VAR");
 
     assert_eq!(out.action, Action::Apply);

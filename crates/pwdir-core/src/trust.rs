@@ -28,8 +28,29 @@ pub fn file_sha256(path: &Path) -> Result<String, PwDirError> {
     Ok(sha256_hex(&fs::read(path)?))
 }
 
+/// 绝对化 + 字符串层规范化（`/`→`\`、去尾分隔符）。
+///
+/// 不使用 `fs::canonicalize`：它会解析 symlink 并产生 `\\?\` verbatim 前缀，
+/// 显示与互操作都麻烦；identity 只需要稳定、无歧义的绝对路径字符串。
+/// 非 UTF-8 路径按 lossy 处理（JSON 边界要求 valid Unicode，SPEC §16.1）；
+/// cwd 不可用（被删除）时相对输入原样返回，后续文件读取会自然报 IO 错误。
+///
+/// trust record 与 cache 条目共用同一命名输入，保证同一 RC 稳定映射到同一文件。
+pub fn canonical_path(p: &Path) -> PathBuf {
+    let absolute = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(p),
+            Err(_) => p.to_path_buf(),
+        }
+    };
+    PathBuf::from(normalize_path_str(&absolute.to_string_lossy()))
+}
+
 /// 临时文件随机后缀（进程 ID + 纳秒时钟）：并发写入不互相覆盖。
-fn random_suffix() -> String {
+/// trust record 与 cache 条目的原子写入共用。
+pub(crate) fn random_suffix() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -124,22 +145,9 @@ impl TrustStore {
         Ok(Some(serde_json::from_slice(&bytes)?))
     }
 
-    /// 绝对化 + 字符串层规范化（`/`→`\`、去尾分隔符）。
-    ///
-    /// 不使用 `fs::canonicalize`：它会解析 symlink 并产生 `\\?\` verbatim 前缀，
-    /// 显示与互操作都麻烦；M1 的 identity 只需要稳定、无歧义的绝对路径字符串。
-    /// 非 UTF-8 路径按 lossy 处理（JSON 边界要求 valid Unicode，SPEC §16.1）；
-    /// cwd 不可用（被删除）时相对输入原样返回，后续文件读取会自然报 IO 错误。
+    /// 绝对化 + 字符串层规范化（见自由函数 [`canonical_path`] 的完整说明）。
     pub fn canonical_path(&self, p: &Path) -> PathBuf {
-        let absolute = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            match std::env::current_dir() {
-                Ok(cwd) => cwd.join(p),
-                Err(_) => p.to_path_buf(),
-            }
-        };
-        PathBuf::from(normalize_path_str(&absolute.to_string_lossy()))
+        canonical_path(p)
     }
 
     /// record 文件名：canonical 路径的 SHA-256 + `.json`。
