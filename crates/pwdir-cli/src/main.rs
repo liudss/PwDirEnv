@@ -7,9 +7,10 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use pwdir_core::dirs;
 use pwdir_core::discovery;
+use pwdir_core::evaluator::EvaluatorConfig;
 use pwdir_core::trust::{self, TrustStore};
 use pwdir_core::PwDirError;
-use pwdir_protocol::{Action, DiscoveredRc, EnvPatch, ExportOutput, PROTOCOL_SCHEMA};
+use pwdir_protocol::DiscoveredRc;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -103,21 +104,16 @@ fn run() -> Result<i32> {
     };
 
     match command {
-        // M3 对接前的占位输出：始终是一个合法的 schema-1 JSON（action=noop，空 patch），
-        // 保证 PowerShell module 可以立即按协议解析
+        // M3：export 走 pwdir-core::export 编排（SPEC §14.7 协议入口）
         Commands::Export { format } => {
             if format != "json" {
                 anyhow::bail!("unsupported export format: {format} (only 'json' is supported)");
             }
-            let output = ExportOutput {
-                schema: PROTOCOL_SCHEMA,
-                action: Action::Noop,
-                rc: None,
-                patch: EnvPatch::default(),
-                managed_keys: vec![],
-                fingerprint: None,
-                diagnostics: vec![],
-            };
+            // cwd 不可用（当前目录被删除）时传空路径：export 返回 Noop + diagnostic，不 panic（SPEC §20.4）
+            let cwd = discovery::current_dir_fs_or_none().unwrap_or_default();
+            let output = pwdir_core::export::export(&cwd, &EvaluatorConfig::default())?;
+            // blocked / error 是协议语义（module 按 JSON 里的 action 分流），仍输出 JSON 并 exit 0；
+            // 只有 export 返回 Err（基础设施故障）才走退出码映射
             println!("{}", serde_json::to_string_pretty(&output)?);
             Ok(0)
         }

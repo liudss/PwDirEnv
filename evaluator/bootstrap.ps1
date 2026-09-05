@@ -75,6 +75,19 @@ try {
         $vars[[string]$entry.Key] = [string]$entry.Value
     }
 
+    # 步骤 6.5：剔除 `-ExecutionPolicy Bypass` 启动参数导致的人工产物（SPEC §7.2）：
+    # pwsh 会把 PSExecutionPolicyPreference 写入自身 Process environment 供子 pwsh 继承，
+    # 这是启动参数的人工产物，Host 里通常没有该变量，原样上报会被 diff 当成"新增变量"
+    # 污染用户会话 —— 不是 RC 的意图，必须在构造 JSON result 前从上报环境中剔除。
+    # [ordered]@{} 的 Remove 行为依赖底层比较器，这里无论其是否区分大小写，
+    # 都遍历 key 做大小写不敏感比较后删除（先物化匹配 key，避免枚举中修改集合抛异常）。
+    $policyArtifactKeys = @(
+        $vars.Keys | Where-Object { [string]$_ -ieq 'PSExecutionPolicyPreference' }
+    )
+    foreach ($artifactKey in $policyArtifactKeys) {
+        $null = $vars.Remove([string]$artifactKey)
+    }
+
     # 步骤 7：构造 JSON result（字段名与 pwdir-protocol::EvaluationResult 对齐；schema/ok 为外层信封）
     $payload = [ordered]@{
         schema        = 1

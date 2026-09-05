@@ -1,6 +1,6 @@
 //! pwdir-core：PwDirEnv native 核心逻辑。
 //!
-//! 模块边界（PLAN §1.1）：本 crate 负责发现 / trust / diff / fingerprint / evaluator 启动 /
+//! 模块边界（PLAN §1.1）：本 crate 负责发现 / trust / diff / export 编排 / evaluator 启动 /
 //! dotenv 解析，不解析 CLI 参数，不直接面向用户输出。
 
 pub mod diff;
@@ -8,6 +8,7 @@ pub mod dirs;
 pub mod discovery;
 pub mod dotenv;
 pub mod evaluator;
+pub mod export;
 pub mod pathutil;
 pub mod trust;
 
