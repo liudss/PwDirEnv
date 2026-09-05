@@ -4,6 +4,7 @@
 //! dotenv 解析，不解析 CLI 参数，不直接面向用户输出。
 
 pub mod diff;
+pub mod dirs;
 pub mod discovery;
 pub mod dotenv;
 pub mod evaluator;
@@ -19,7 +20,9 @@ pub enum PwDirError {
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("rc file not found: {0}")]
+    /// RC 未找到。payload 是面向用户的完整句子（如 SPEC §14.1 要求的精确提示），
+    /// CLI 原样输出到 stderr，因此这里不再叠加 "rc file not found:" 前缀。
+    #[error("{0}")]
     RcNotFound(String),
     #[error("rc file is not allowed: {0}")]
     NotAllowed(String),

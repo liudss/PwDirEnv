@@ -14,6 +14,18 @@ use serde::{Deserialize, Serialize};
 /// 协议 schema 版本。结构变更必须提升此值。
 pub const PROTOCOL_SCHEMA: u32 = 1;
 
+/// 唯一默认 RC 文件名（SPEC §5.1）。
+///
+/// 首版不识别 Bash 语义的 `.envrc`，避免把 Bash 脚本交给 PowerShell evaluator。
+pub const RC_FILENAME: &str = ".envrc.ps1";
+
+/// 向上发现的结果：RC 文件与其所属 project root（即 RC 所在目录，SPEC §5.2/§16）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredRc {
+    pub project_root: PathBuf,
+    pub rc_path: PathBuf,
+}
+
 /// Windows 环境变量名（大小写不敏感语义，SPEC §8.2）。
 ///
 /// `canonical` 为 ASCII invariant uppercase，用于归并与比较；
@@ -195,6 +207,24 @@ mod tests {
         );
         let back: WatchDependency = serde_json::from_value(value).unwrap();
         assert_eq!(back, dep);
+    }
+
+    #[test]
+    fn discovered_rc_serde_round_trips() {
+        let rc = DiscoveredRc {
+            project_root: PathBuf::from(r"C:\src\app"),
+            rc_path: PathBuf::from(r"C:\src\app\.envrc.ps1"),
+        };
+        let value = serde_json::to_value(&rc).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "project_root": r"C:\src\app",
+                "rc_path": r"C:\src\app\.envrc.ps1",
+            })
+        );
+        let back: DiscoveredRc = serde_json::from_value(value).unwrap();
+        assert_eq!(back, rc);
     }
 
     #[test]

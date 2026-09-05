@@ -1,11 +1,15 @@
 //! pwdir.exe：CLI 解析与命令路由（PLAN §1.1）。命令实现分布在 pwdir-core，
 //! 本 crate 不重复实现 core 逻辑。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
-use pwdir_protocol::{Action, EnvPatch, ExportOutput, PROTOCOL_SCHEMA};
+use pwdir_core::dirs;
+use pwdir_core::discovery;
+use pwdir_core::trust::{self, TrustStore};
+use pwdir_core::PwDirError;
+use pwdir_protocol::{Action, DiscoveredRc, EnvPatch, ExportOutput, PROTOCOL_SCHEMA};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -22,12 +26,12 @@ struct PwDirCli {
 enum Commands {
     /// Authorize the RC file content (by SHA-256)
     Allow {
-        /// Path to the RC file; defaults to the RC for the current directory
+        /// Path to the RC file (or a directory to discover from); defaults to the RC for the current directory
         path: Option<PathBuf>,
     },
-    /// Revoke the authorization of an RC file
+    /// Revoke the authorization of an RC file (idempotent)
     Deny {
-        /// Path to the RC file; defaults to the RC for the current directory
+        /// Path to the RC file (or a directory to discover from); defaults to the RC for the current directory
         path: Option<PathBuf>,
     },
     /// Show current status
@@ -62,13 +66,28 @@ enum Commands {
     Doctor,
 }
 
+/// SPEC §14.1 退出码映射：0 成功 / 2 RcNotFound / 3 IO error / 1 其它。
+fn exit_code_for(err: &PwDirError) -> i32 {
+    match err {
+        PwDirError::RcNotFound(_) => 2,
+        PwDirError::Io(_) => 3,
+        _ => 1,
+    }
+}
+
 fn main() {
     let code = match run() {
         Ok(code) => code,
         Err(err) => {
-            // 退出码约定（SPEC §14.1）：0 成功、2 RC 找不到、3 IO error；未实现先用 1
-            eprintln!("pwdir: error: {err:#}");
-            1
+            // PwDirError 的 Display 文本即面向用户的最终消息（RcNotFound 携带完整句子）；
+            // 其它 anyhow 错误（参数解析等）走通用前缀
+            if let Some(pw_err) = err.downcast_ref::<PwDirError>() {
+                eprintln!("pwdir: {pw_err}");
+                exit_code_for(pw_err)
+            } else {
+                eprintln!("pwdir: error: {err:#}");
+                1
+            }
         }
     };
     std::process::exit(code);
@@ -102,12 +121,187 @@ fn run() -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&output)?);
             Ok(0)
         }
-        Commands::Allow { .. } => Err(anyhow::anyhow!("not implemented yet (milestone 1)")),
-        Commands::Deny { .. } => Err(anyhow::anyhow!("not implemented yet (milestone 1)")),
-        Commands::Status { .. } => Err(anyhow::anyhow!("not implemented yet (milestone 1)")),
+        // M1 done: allow / deny / status（discovery + trust）
+        Commands::Allow { path } => Ok(cmd_allow(path.as_deref())?),
+        Commands::Deny { path } => Ok(cmd_deny(path.as_deref())?),
+        Commands::Status { json } => Ok(cmd_status(json)?),
+        // TODO(M6): fingerprint 快速路径失效
         Commands::Reload => Err(anyhow::anyhow!("not implemented yet (milestone 6)")),
+        // TODO(M7): argv-safe exec
         Commands::Exec { .. } => Err(anyhow::anyhow!("not implemented yet (milestone 7)")),
+        // TODO(M4): hook bootstrap 输出
         Commands::Hook { .. } => Err(anyhow::anyhow!("not implemented yet (milestone 4)")),
+        // TODO(M7): doctor
         Commands::Doctor => Err(anyhow::anyhow!("not implemented yet (milestone 7)")),
+    }
+}
+
+/// 解析目标 RC（allow / deny 共用）：
+/// - 未给 path：从当前目录向上发现；
+/// - path 是目录：从该目录向上发现；
+/// - path 是其它（显式 RC 文件路径，可能尚不存在）：直接使用，parent 作为 project root；
+///   文件读取失败会在 allow 阶段以 IO 错误暴露（exit 3）。
+fn resolve_rc(path: Option<&Path>) -> Result<DiscoveredRc, PwDirError> {
+    match path {
+        None => discover_from(&current_dir_or_rc_error()?),
+        Some(p) if p.is_dir() => discover_from(p),
+        Some(p) => {
+            let project_root = p
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            Ok(DiscoveredRc {
+                project_root,
+                rc_path: p.to_path_buf(),
+            })
+        }
+    }
+}
+
+fn discover_from(dir: &Path) -> Result<DiscoveredRc, PwDirError> {
+    discovery::find_rc(dir)?.ok_or_else(|| {
+        PwDirError::RcNotFound("no .envrc.ps1 found in this or any parent directory".to_string())
+    })
+}
+
+/// SPEC §5.4/§20.4：当前目录不可用（被删除）时不 panic，按"找不到 RC"处理。
+fn current_dir_or_rc_error() -> Result<PathBuf, PwDirError> {
+    discovery::current_dir_fs_or_none().ok_or_else(|| {
+        PwDirError::RcNotFound(
+            "current directory is unavailable; no .envrc.ps1 found in this or any parent directory"
+                .to_string(),
+        )
+    })
+}
+
+fn cmd_allow(path: Option<&Path>) -> Result<i32, PwDirError> {
+    let rc = resolve_rc(path)?;
+    let store = TrustStore::open()?;
+    let record = store.allow(&rc.rc_path)?;
+    println!("pwdir: allowed {}", record.path.display());
+    Ok(0)
+}
+
+fn cmd_deny(path: Option<&Path>) -> Result<i32, PwDirError> {
+    // deny 是幂等操作：没有 RC 就没有可撤销的授权（exit 0）
+    let rc = match resolve_rc(path) {
+        Ok(rc) => rc,
+        Err(PwDirError::RcNotFound(_)) => {
+            println!("pwdir: nothing to deny");
+            return Ok(0);
+        }
+        Err(err) => return Err(err),
+    };
+    let store = TrustStore::open()?;
+    store.deny(&rc.rc_path)?;
+    println!(
+        "pwdir: denied {}",
+        store.canonical_path(&rc.rc_path).display()
+    );
+    Ok(0)
+}
+
+fn cmd_status(json: bool) -> Result<i32, PwDirError> {
+    let cwd = discovery::current_dir_fs_or_none();
+    // 发现失败（IO）不视为 status 失败：按"无 RC"呈现（SPEC §14.3，status 不做 evaluation）
+    let discovered = cwd
+        .as_deref()
+        .and_then(|dir| discovery::find_rc(dir).ok().flatten());
+
+    // trust 三态：none = 无 record；allowed = hash 匹配；blocked = 有 record 但内容已变
+    let (trust_status, rc_sha256) = match &discovered {
+        None => ("none".to_string(), None),
+        Some(rc) => {
+            let store = TrustStore::open()?;
+            match store.record(&rc.rc_path)? {
+                None => ("none".to_string(), None),
+                Some(record) => {
+                    // rc_sha256 显示当前内容的 hash；发现后文件被删（竞态）→ 视为不匹配
+                    let current = trust::file_sha256(&rc.rc_path).ok();
+                    let matched = current.as_deref() == Some(record.sha256.as_str());
+                    let status = if matched { "allowed" } else { "blocked" };
+                    (status.to_string(), current)
+                }
+            }
+        }
+    };
+
+    let dirs_root = dirs::pwdir_data_root().ok();
+
+    if json {
+        let payload = serde_json::json!({
+            "cwd": cwd,
+            "discovered_rc": discovered,
+            "trust_status": trust_status,
+            "rc_sha256": rc_sha256,
+            "dirs": dirs_root.map(|root| serde_json::json!({
+                "allow": root.join("allow"),
+                "cache": root.join("cache"),
+                "state": root.join("state"),
+            })),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!(
+            "pwdir: cwd:             {}",
+            cwd.as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(unavailable)".to_string())
+        );
+        println!(
+            "pwdir: discovered rc:   {}",
+            discovered
+                .as_ref()
+                .map(|rc| rc.rc_path.display().to_string())
+                .unwrap_or_else(|| "(none)".to_string())
+        );
+        println!("pwdir: trust status:    {trust_status}");
+        println!(
+            "pwdir: rc sha256:       {}",
+            rc_sha256.as_deref().unwrap_or("(none)")
+        );
+        match &dirs_root {
+            Some(root) => {
+                println!("pwdir: storage allow:   {}", root.join("allow").display());
+                println!("pwdir: storage cache:   {}", root.join("cache").display());
+                println!("pwdir: storage state:   {}", root.join("state").display());
+            }
+            None => println!("pwdir: storage:         (unavailable)"),
+        }
+    }
+    Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_codes_follow_spec_14_1() {
+        assert_eq!(exit_code_for(&PwDirError::RcNotFound("x".into())), 2);
+        assert_eq!(
+            exit_code_for(&PwDirError::Io(std::io::Error::other("boom"))),
+            3
+        );
+        assert_eq!(exit_code_for(&PwDirError::NotImplemented("x".into())), 1);
+    }
+
+    #[test]
+    fn resolve_rc_uses_explicit_file_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rc = tmp.path().join(".envrc.ps1");
+        std::fs::write(&rc, b"$env:A = '1'").expect("write rc");
+
+        let found = resolve_rc(Some(&rc)).expect("resolve rc");
+        assert_eq!(found.rc_path, rc);
+        assert_eq!(found.project_root, tmp.path());
+    }
+
+    #[test]
+    fn resolve_rc_directory_without_rc_is_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let err = resolve_rc(Some(tmp.path())).expect_err("must be RcNotFound");
+        assert!(matches!(err, PwDirError::RcNotFound(_)));
     }
 }
