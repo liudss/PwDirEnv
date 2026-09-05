@@ -1,0 +1,16 @@
+[package]
+name = "pwdir-cli"
+version.workspace = true
+edition.workspace = true
+description = "PwDirEnv CLI (pwdir.exe): argument parsing and command routing"
+
+[[bin]]
+name = "pwdir"
+path = "src/main.rs"
+
+[dependencies]
+pwdir-core = { path = "../pwdir-core" }
+pwdir-protocol = { path = "../pwdir-protocol" }
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true

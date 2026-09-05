@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable (clippy + fmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: PowerShell module import smoke
+        shell: pwsh
+        run: pwsh -NoProfile -Command 'Import-Module ./powershell/PwDirEnv/PwDirEnv.psd1 -Force'
+
+      # TODO(M4): Pester 单元测试（本机 Pester 3.4.0 版本过旧，升级到 5.x 后启用）
+      # - name: Pester tests
+      #   shell: pwsh
+      #   run: |
+      #     Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force
+      #     Invoke-Pester ./tests -CI

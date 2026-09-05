@@ -1,0 +1,14 @@
+[package]
+name = "pwdir-core"
+version.workspace = true
+edition.workspace = true
+description = "PwDirEnv native core: discovery / trust / diff / fingerprint / evaluator launcher / dotenv"
+
+[dependencies]
+pwdir-protocol = { path = "../pwdir-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true
+chrono.workspace = true

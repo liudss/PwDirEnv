@@ -1,0 +1,10 @@
+[package]
+name = "pwdir-protocol"
+version.workspace = true
+edition.workspace = true
+description = "PwDirEnv protocol data structures (JSON schema v1), pure data with serde, no IO"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
