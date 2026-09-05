@@ -215,15 +215,17 @@ fn run(
     })
 }
 
-fn missing_pipe_error(which: &str) -> PwDirError {
+/// 管道缺失的统一错误（evaluator 与 exec 共用）。
+pub(crate) fn missing_pipe_error(which: &str) -> PwDirError {
     PwDirError::Io(std::io::Error::other(format!(
-        "evaluator child process did not provide a {which} pipe"
+        "child process did not provide a {which} pipe"
     )))
 }
 
 /// 排空管道为 String。pwsh 输出按控制台编码（Windows 上通常 UTF-8）；
 /// 无法解码的字节做有损替换 —— 诊断通道允许 lossy，协议通道在结果文件里。
-fn drain_to_string(mut pipe: impl Read) -> String {
+/// evaluator 与 exec 的子进程输出捕获共用。
+pub(crate) fn drain_to_string(mut pipe: impl Read) -> String {
     let mut buf = Vec::new();
     let _ = pipe.read_to_end(&mut buf);
     String::from_utf8_lossy(&buf).into_owned()

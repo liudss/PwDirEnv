@@ -169,7 +169,7 @@ key 不合规或无 `=` 的行静默跳过；**不做** command substitution 与
 | M4 | PowerShell Module + Hook（Enable/Disable/hook、apply/restore） | ✅ |
 | M5 | stdlib（PATH_add / dotenv / watch_file / source_env / source_up） | ✅ |
 | M6 | Cache + Reload（fingerprint 快速路径） | ✅ |
-| M7 | exec + doctor + 打包 | pending |
+| M7 | exec + doctor + 打包 | ✅ |
 
 ## Cache 与快速路径（M6）
 
@@ -196,3 +196,64 @@ key 不合规或无 `=` 的行静默跳过；**不做** command substitution 与
   原子替换（与 trust store 同源），损坏 / 未识别 schema 的条目按未命中安全降级。
 - **状态**：`pwdir status [--json]` 新增 `cache_status`（`none` = 无条目；`fresh` = 指纹与
   当前现实一致；`stale` = 有条目但已失效）。status 只读呈现，不评估、不写 cache。
+
+## exec / doctor / hook install / packaging（M7）
+
+### `pwdir exec <DIR> <COMMAND> [ARGS...]`（SPEC §14.5）
+
+以解析后的项目环境启动任意子进程：
+
+- **trust 边界**：RC 未 allow → `rc file is not allowed: run \`pwdir allow\``（exit 1），
+  **RC 内容一行都不执行**，COMMAND 也不会被 spawn；
+- **argv-safe**：`Command::new(command).args(args).current_dir(dir)` 直接走 OS 进程模型，
+  绝不经 shell 字符串拼接（SPEC §27），参数中的空格 / 引号 / `$` 天然安全；
+- **环境注入**：diff（pwdir 进程环境 → evaluator resulting environment）通过
+  `Command::env` / `env_remove` 叠加到子进程继承环境上，User/Machine scope 永不触碰；
+- **超时**：evaluator 用 exec 专用 60s 超时（SPEC §7.6 "exec 可允许更长"），hook 的 10s
+  默认值不受影响；COMMAND 本身不设超时（长任务属预期）；
+- **退出码**：COMMAND 的 exit code 原样传播（`pwdir exec` 以它退出）；stdout/stderr
+  双管道并发排空后字节级透传；`--require-rc` 在无 RC 时报 `RcNotFound`（exit 2），
+  默认无 RC 时以继承环境直接执行；
+- **错误映射**：RcNotFound→2、Io→3、NotAllowed→1、EvaluationFailed→1；
+  COMMAND 不存在时给出友好提示（绝对路径 / PATH）。
+
+### `pwdir doctor [--json]`（SPEC §14.8）
+
+逐项自检，单项失败不中断；人类输出 `[OK]/[WARN]/[FAIL] name: message`，`--json` 输出
+`{ "checks":[{name,status,message}], "all_ok": bool }`。存在 `fail` 项 → exit 1。
+
+| 检查项 | 内容 |
+|---|---|
+| `os` | OS + ARCH，Windows 上 best-effort 追加 registry DisplayVersion |
+| `pwsh` / `powershell-version` | pwsh 可用性；主版本 <7 Fail（5.1 不支持），7.x <7.2 Warn（目标 ≥ 7.2） |
+| `module` | 相对 current_exe 依次探测 `modules\PwDirEnv\PwDirEnv.psd1`（平铺布局）、`..\modules\PwDirEnv\PwDirEnv.psd1`（packaging 标准布局，bin 与 modules 同级）或 `..\..\powershell\PwDirEnv\PwDirEnv.psd1`（开发布局）；缺失 Warn |
+| `profile-hook` | `$PROFILE.CurrentUserAllHosts` 存在且含 PwDirEnv marker → Ok，否则 Warn 并提示 `pwdir hook install` |
+| `localappdata` | 数据根 allow/cache/state 逐一写删探针，任一不可写 Fail |
+| `temp-dir` | `%TEMP%` 可写性（evaluator 结果通道依赖） |
+| `execution-policy` | Process scope 策略；Restricted/AllSigned Warn（evaluator 以 `-ExecutionPolicy Bypass` 仅作用于自身进程，SPEC §7.2） |
+| `long-path` | registry `LongPathsEnabled`：1 Ok / 0 Warn |
+
+### `pwdir hook pwsh` / `install` / `uninstall`（SPEC §3.1/§14.6）
+
+- `pwdir hook pwsh`：输出两行极小 bootstrap（`Import-Module '<psd1 绝对路径>'` +
+  `Enable-PwDirEnv`）；模块缺失时输出占位符片段并打 Warn；
+- `pwdir hook install [--yes] [--path <file>]`：往目标 profile 写入
+  `# >>> PwDirEnv (begin) >>>` … `# <<< PwDirEnv (end) <<<` marker 块（内含上述两行）。
+  默认目标 = `$PROFILE.CurrentUserAllHosts`（对 pwsh 全部 host 生效），`--path` 覆盖；
+  文件不存在则创建（UTF-8 无 BOM，行结束符沿用文件现有 CRLF/LF 风格）；
+  已含 marker → `already installed` 幂等；未给 `--yes` 且 stdin 是 tty 时先确认，
+  非交互直接写；文件 IO 错误 exit 3；
+- `pwdir hook uninstall [--path <file>]`：按行移除 marker 块（块外内容原样保留）；
+  无 marker → `nothing to uninstall`。
+
+### packaging（M7）
+
+```powershell
+pwsh -NoProfile -File packaging\install.ps1            # 构建 + 安装到 %LOCALAPPDATA%\Programs\PwDirEnv
+pwsh -NoProfile -File packaging\install.ps1 -SkipBuild # 复用现有 target\release 产物
+```
+
+脚本组装并校验 `dist\pwdir` 标准布局（`bin\pwdir.exe` + `modules\PwDirEnv\{psd1,psm1}`），
+拷贝到 InstallRoot 后打印后续步骤（① bin 加 PATH 或设 `PWDIRENV_EXE`；② Import-Module；
+③ `pwdir hook install --yes`）—— **不自动修改系统/用户 PATH**（最小侵入）。
+winget manifest 占位见 `packaging/winget/`（正式发布流程不在仓库范围）。

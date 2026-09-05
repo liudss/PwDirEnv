@@ -1,0 +1,39 @@
+# PwDirEnv winget manifest（占位骨架）。
+#
+# 正式发布流程不在本仓库范围：需向 microsoft/winget-pkgs 提交 PR 并通过 manifest
+# validation。发布前必须补齐：
+#   - InstallerUrl（真实 release zip 下载地址）
+#   - InstallerSha256（对 zip 文件计算的 SHA-256）
+#   - 包元数据（Publisher / PackageUrl / LicenseUrl / Tags / 发布者协议确认）
+# zip 内容布局必须与 packaging/winget/README.md 描述一致（bin\pwdir.exe + modules\PwDirEnv\）。
+PackageIdentifier: PwDirEnv.PwDirEnv
+PackageVersion: 0.1.0
+PackageName: PwDirEnv
+Publisher: PwDirEnv Contributors
+License: MIT
+ShortDescription: Directory environment manager for PowerShell 7+ on Windows (direnv equivalent)
+Description: |-
+  PwDirEnv loads per-directory environments defined as real PowerShell scripts
+  (.envrc.ps1). The script runs in an isolated pwsh evaluator subprocess; only
+  the environment variable diff is applied to the host session. Trust is
+  content-hash based (allow / deny), with watch dependencies and a fingerprint
+  fast path.
+Moniker: pwdir
+PackageUrl: https://example.invalid/PwDirEnv
+Tags:
+  - powershell
+  - direnv
+  - environment
+  - windows
+  - developer-tools
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: pwdir\bin\pwdir.exe
+        PortableCommandAlias: pwdir
+    InstallerUrl: https://example.invalid/releases/PwDirEnv-0.1.0-x64.zip
+    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+ManifestType: singleton
+ManifestVersion: 1.6.0

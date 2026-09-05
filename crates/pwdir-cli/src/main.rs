@@ -1,6 +1,7 @@
 //! pwdir.exe：CLI 解析与命令路由（PLAN §1.1）。命令实现分布在 pwdir-core，
 //! 本 crate 不重复实现 core 逻辑。
 
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -8,11 +9,15 @@ use clap::{CommandFactory, Parser, Subcommand};
 use pwdir_core::cache::CacheStore;
 use pwdir_core::dirs;
 use pwdir_core::discovery;
+use pwdir_core::doctor::{self, CheckStatus};
 use pwdir_core::evaluator::EvaluatorConfig;
+use pwdir_core::exec;
 use pwdir_core::fingerprint::fingerprint_is_current;
 use pwdir_core::trust::{self, TrustStore};
 use pwdir_core::PwDirError;
 use pwdir_protocol::DiscoveredRc;
+
+mod hook;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,8 +56,13 @@ enum Commands {
         dir: PathBuf,
         /// Command to execute
         command: String,
-        /// Command arguments
+        /// Command arguments (everything after COMMAND is passed through verbatim,
+        /// so flags like `pwsh -NoProfile` are never parsed as pwdir options)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+        /// Fail when no RC is found (default: run with the inherited environment)
+        #[arg(long)]
+        require_rc: bool,
     },
     /// Export the environment patch (Host module protocol entry, SPEC §14.7)
     Export {
@@ -63,13 +73,38 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Print the shell hook bootstrap snippet
+    /// Shell hook operations (print bootstrap snippet / install / uninstall)
     Hook {
-        /// Target shell (currently: pwsh)
-        shell: String,
+        #[command(subcommand)]
+        action: HookAction,
     },
     /// Diagnose the environment (pwsh version, trust/cache dirs, ExecutionPolicy, ...)
-    Doctor,
+    Doctor {
+        /// Output checks in a stable JSON schema
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HookAction {
+    /// Print the pwsh hook bootstrap snippet (Import-Module + Enable-PwDirEnv)
+    Pwsh,
+    /// Install the PwDirEnv hook block into the PowerShell profile (idempotent)
+    Install {
+        /// Skip the interactive confirmation prompt
+        #[arg(long)]
+        yes: bool,
+        /// Target profile file (defaults to $PROFILE.CurrentUserAllHosts)
+        #[arg(long, value_name = "FILE")]
+        path: Option<PathBuf>,
+    },
+    /// Remove the PwDirEnv hook block from the PowerShell profile
+    Uninstall {
+        /// Target profile file (defaults to $PROFILE.CurrentUserAllHosts)
+        #[arg(long, value_name = "FILE")]
+        path: Option<PathBuf>,
+    },
 }
 
 /// SPEC §14.1 退出码映射：0 成功 / 2 RcNotFound / 3 IO error / 1 其它。
@@ -128,12 +163,21 @@ fn run() -> Result<i32> {
         Commands::Status { json } => Ok(cmd_status(json)?),
         // M6：使当前 RC 的 fingerprint cache 失效（SPEC §14.4）
         Commands::Reload => Ok(cmd_reload()?),
-        // TODO(M7): argv-safe exec
-        Commands::Exec { .. } => Err(anyhow::anyhow!("not implemented yet (milestone 7)")),
-        // TODO(M4): hook bootstrap 输出
-        Commands::Hook { .. } => Err(anyhow::anyhow!("not implemented yet (milestone 4)")),
-        // TODO(M7): doctor
-        Commands::Doctor => Err(anyhow::anyhow!("not implemented yet (milestone 7)")),
+        // M7：argv-safe exec（SPEC §14.5）
+        Commands::Exec {
+            dir,
+            command,
+            args,
+            require_rc,
+        } => Ok(cmd_exec(&dir, &command, &args, require_rc)?),
+        // M7：hook bootstrap / install / uninstall（SPEC §3.1/§14.6）
+        Commands::Hook { action } => match action {
+            HookAction::Pwsh => Ok(cmd_hook_pwsh()?),
+            HookAction::Install { yes, path } => Ok(cmd_hook_install(yes, path.as_deref())?),
+            HookAction::Uninstall { path } => Ok(cmd_hook_uninstall(path.as_deref())?),
+        },
+        // M7：doctor（SPEC §14.8）
+        Commands::Doctor { json } => Ok(cmd_doctor(json)?),
     }
 }
 
@@ -318,6 +362,140 @@ fn cmd_status(json: bool) -> Result<i32, PwDirError> {
         }
     }
     Ok(0)
+}
+
+/// `pwdir exec`（M7，SPEC §14.5）：以解析后的项目环境启动 COMMAND，原样转发
+/// stdout/stderr 并以子进程退出码退出。错误经 exit_code_for 映射：
+/// RcNotFound→2 / Io→3 / NotAllowed→1 / EvaluationFailed→1。
+fn cmd_exec(
+    dir: &Path,
+    command: &str,
+    args: &[String],
+    require_rc: bool,
+) -> Result<i32, PwDirError> {
+    let outcome = exec::run_exec(dir, command, args, require_rc, &EvaluatorConfig::default())?;
+    // 字节级透传，不追加换行（子进程输出保持原样）
+    {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(outcome.stdout.as_bytes())?;
+        stdout.flush()?;
+    }
+    {
+        let mut stderr = io::stderr().lock();
+        stderr.write_all(outcome.stderr.as_bytes())?;
+        stderr.flush()?;
+    }
+    Ok(outcome.exit_code.unwrap_or(1))
+}
+
+/// `pwdir hook pwsh`（SPEC §14.6）：输出两行极小 bootstrap。模块路径解析失败时
+/// 输出占位符片段并打 Warn —— 用户能立刻看到 snippet 形态，同时知道需要先装模块。
+fn cmd_hook_pwsh() -> Result<i32> {
+    let (module_display, resolved) = match doctor::module_manifest_path() {
+        Some(path) => (path.display().to_string(), true),
+        None => (
+            "<PwDirEnv.psd1 path not found; run packaging/install.ps1 first>".to_string(),
+            false,
+        ),
+    };
+    let block = hook::hook_block_lines(&module_display);
+    // hook 块去掉 marker 后正是两行 bootstrap
+    for line in &block[1..block.len() - 1] {
+        println!("{line}");
+    }
+    if !resolved {
+        eprintln!(
+            "pwdir: warning: PwDirEnv.psd1 not found next to pwdir.exe; the snippet above \
+             contains a placeholder path"
+        );
+    }
+    Ok(0)
+}
+
+/// hook install / uninstall 共用的目标文件解析：`--path` 覆盖默认的
+/// `$PROFILE.CurrentUserAllHosts.Path`（doctor 与 hook 共用同一查询）。
+fn resolve_hook_target(path: Option<&Path>) -> Result<PathBuf> {
+    match path {
+        Some(p) => Ok(p.to_path_buf()),
+        None => doctor::current_user_all_hosts_profile().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot resolve $PROFILE.CurrentUserAllHosts (pwsh unavailable?); \
+                 pass --path <file> explicitly"
+            )
+        }),
+    }
+}
+
+/// `pwdir hook install`：往目标 profile 写 marker 块（幂等）。未给 --yes 且 stdin 是
+/// tty 时先确认；非交互（管道/CI）直接写，避免脚本化安装被挂起。
+/// 文件 IO 失败 → PwDirError::Io → exit 3；目标解析失败 → 通用错误 exit 1。
+fn cmd_hook_install(yes: bool, path: Option<&Path>) -> Result<i32> {
+    let target = resolve_hook_target(path)?;
+    if !yes && io::stdin().is_terminal() {
+        print!("pwdir: 将修改 {}，继续? (y/N) ", target.display());
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        let answer = answer.trim().to_ascii_lowercase();
+        if answer != "y" && answer != "yes" {
+            println!("pwdir: aborted");
+            return Ok(0);
+        }
+    }
+    let module_display = match doctor::module_manifest_path() {
+        Some(path) => path.display().to_string(),
+        None => "<PwDirEnv.psd1 path not found; run packaging/install.ps1 first>".to_string(),
+    };
+    let block = hook::hook_block_lines(&module_display);
+    match hook::install_to_file(&target, &block) {
+        Ok(true) => println!("pwdir: hook installed in {}", target.display()),
+        Ok(false) => println!("pwdir: already installed in {}", target.display()),
+        Err(e) => return Err(PwDirError::Io(e).into()),
+    }
+    Ok(0)
+}
+
+/// `pwdir hook uninstall`：按 marker 移除块（幂等；无块时 nothing to uninstall）。
+/// 文件 IO 失败 → exit 3。
+fn cmd_hook_uninstall(path: Option<&Path>) -> Result<i32> {
+    let target = resolve_hook_target(path)?;
+    match hook::uninstall_from_file(&target) {
+        Ok(true) => println!("pwdir: hook removed from {}", target.display()),
+        Ok(false) => println!("pwdir: nothing to uninstall"),
+        Err(e) => return Err(PwDirError::Io(e).into()),
+    }
+    Ok(0)
+}
+
+/// `pwdir doctor`（M7，SPEC §14.8）：逐项输出 `[OK]/[WARN]/[FAIL]`，
+/// `--json` 输出稳定 schema；存在 Fail 项 → exit 1，否则 0。
+fn cmd_doctor(json: bool) -> Result<i32> {
+    let checks = doctor::diagnose();
+    let all_ok = doctor::is_all_ok(&checks);
+    if json {
+        let payload = serde_json::json!({
+            "checks": checks
+                .iter()
+                .map(|c| serde_json::json!({
+                    "name": c.name,
+                    "status": c.status.as_str(),
+                    "message": c.message,
+                }))
+                .collect::<Vec<_>>(),
+            "all_ok": all_ok,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        for check in &checks {
+            let tag = match check.status {
+                CheckStatus::Ok => "[OK]",
+                CheckStatus::Warn => "[WARN]",
+                CheckStatus::Fail => "[FAIL]",
+            };
+            println!("{tag} {}: {}", check.name, check.message);
+        }
+    }
+    Ok(if all_ok { 0 } else { 1 })
 }
 
 #[cfg(test)]
