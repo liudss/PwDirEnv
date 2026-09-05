@@ -93,6 +93,43 @@ pwsh -NoProfile -File tests/e2e_trust.ps1
   空串是"存在但空"：baseline 无 PATH + desired `PATH=''` → set 空串；
   baseline `PATH=''` + desired `'abc'` → set `'abc'`；baseline 有（含空串）+ desired 无 → unset。
 
+## Host Module 与 Hook（M4）
+
+`powershell/PwDirEnv` 是 Host Shell 侧的唯一入口（SPEC §15）：
+
+```powershell
+Import-Module PwDirEnv            # 或显式 -Path powershell\PwDirEnv\PwDirEnv.psd1
+Enable-PwDirEnv [-PwDirPath <pwdir.exe>]
+# ... 正常工作，hook 在每次 prompt 渲染前自动执行
+Disable-PwDirEnv                  # 完整恢复现场
+```
+
+- **安装 hook**：`Enable-PwDirEnv` 保存用户现有 `prompt` 的 ScriptBlock（须定义在
+  global 作用域，即 `$PROFILE` —— 模块按自身作用域链查找，看不到脚本局部作用域的 prompt）
+  并安装 wrapper：先执行 `Invoke-PwDirEnvHook`，再回调原 prompt。`Disable-PwDirEnv`
+  恢复原 prompt（无原 prompt 时删除 wrapper）。幂等。
+- **加载与卸载**：hook 每次 prompt 都调用 `pwdir export --format json`（评估发生在 pwdir.exe
+  的隔离子进程，Host 从不下钻执行 RC），只把返回的结构化 patch 逐 key 应用到
+  **Process scope**（`[Environment]::SetEnvironmentVariable`，**禁止 Invoke-Expression**，
+  SPEC §15.1/§27），绝不触碰 User/Machine（ADR-006）。
+- **恢复模型**（SPEC §8.4/§8.5）：Host 记录每个 managed key 应用前的原值
+  （`Existed`/`Value`，不用哨兵值）。切换 RC A→B 时先按 A 的 baseline 恢复到干净
+  Host 环境，再从该干净环境重新 export B 再应用；离开项目（进入无 RC 目录、cwd 不可用、
+  Disable）时按 baseline 恢复——用户对 managed key 的手动修改一并丢弃（PwDirEnv owns it）。
+- **错误语义**：hook 永不抛错（catch 一切，SPEC §13.4）。同项目内 RC 评估失败/超时保持
+  last-known-good；RC blocked（内容 hash 变化）保持 last-known-good 并提示 `pwdir allow`；
+  切换到新项目失败则旧环境已恢复、保持干净 baseline。
+- **日志**（SPEC §19）：`pwdir: loading/unloading <rc>`、`pwdir: export +NEW ~CHANGED -GONE`
+  （+ 新增 / ~ 修改 / - 删除，对照 baseline，值绝不打印）。error/warn 带颜色。
+- **状态**：`Get-PwDirEnvStatus` 返回 `Version / Enabled / PwDirExe / ActiveRc /
+  ManagedKeys / HookRunning / BaselineCount / Fingerprint`（M4 恒为 `$null`，M6 启用）。
+
+真实验收（A→child→B→outside 恢复 + blocked + prompt 保留，release blocker）：
+
+```powershell
+pwsh -NoProfile -File tests/e2e_hook.ps1
+```
+
 ## MVP 里程碑状态
 
 | 里程碑 | 内容 | 状态 |
@@ -101,7 +138,7 @@ pwsh -NoProfile -File tests/e2e_trust.ps1
 | M1 | Discovery + Trust（向上发现、SHA-256 trust store、allow/deny/status） | ✅ |
 | M2 | Evaluator（spawn pwsh、bootstrap、env capture、timeout） | ✅ |
 | M3 | Diff + Export（大小写不敏感 diff、`pwdir export --format json`） | ✅ |
-| M4 | PowerShell Module + Hook（Enable/Disable/hook、apply/restore） | pending |
+| M4 | PowerShell Module + Hook（Enable/Disable/hook、apply/restore） | ✅ |
 | M5 | stdlib（PATH_add / dotenv / watch_file / source_env / source_up） | pending |
 | M6 | Cache + Reload（fingerprint 快速路径） | pending |
 | M7 | exec + doctor + 打包 | pending |
