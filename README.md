@@ -130,6 +130,34 @@ Disable-PwDirEnv                  # 完整恢复现场
 pwsh -NoProfile -File tests/e2e_hook.ps1
 ```
 
+## Evaluator stdlib helpers（M5）
+
+`evaluator/stdlib.ps1` 在 RC dot-source 之前由 bootstrap 注入 evaluator（SPEC §10）。helper 直接读写
+evaluator 进程环境（`$env:` / `$script:__PwDirEnvState`），其 effect 随 evaluator 结束被 core 捕获进
+desired environment。**所有相对路径一律以 project root 为基准解析**（而非 `$PWD` —— RC 可能再
+`Set-Location`，语义必须稳定指向项目根），且允许路径尚不存在（不做 `Resolve-Path`）。
+
+| Helper | 语义 |
+|---|---|
+| `PATH_add <path>` | 相对路径解析到 project root 后 **prepend** 到 `$env:PATH`；等价项（Windows 语义：大小写不敏感、`/`→`\`、尾分隔符无关，纯字符串比较）去重后移到最前；PATH 缺失 / 为空视为空 PATH。 |
+| `dotenv [path]` | 解析 `.env`（默认）并设置变量；文件不存在 → **throw，evaluation 失败**。 |
+| `dotenv_if_exists [path]` | 同 `dotenv`，但文件不存在时静默跳过。 |
+| `dotenv -Overload` | dotenv / dotenv_if_exists 均支持：强制覆盖已存在的环境变量。 |
+| `watch_file <path> [...]` | 注册 file watch 依赖（支持多参数；相同 kind + 等价路径去重）。 |
+| `watch_dir <path> [...]` | 注册 dir watch 依赖（同上）。 |
+| `source_env <path>` | 在 evaluator 当前 scope dot-source 指定 `.ps1`（`$PSScriptRoot` 语义保留）；不存在 → throw；成功后自动纳入 `watches` 与 `sourced_files`（fingerprint 元数据，SPEC §10.1）。 |
+| `source_up [filename]` | 从 project root 的**父目录**向上搜索最近的 `<filename>`（默认 `.envrc.ps1`，不含 project root 自身）；找到即 `source_env`，未找到为 no-op。 |
+
+**dotenv 语法子集**（SPEC §11 最小语义）：UTF-8（BOM 自动剥离）、CRLF/LF、空行与 `#` 注释行忽略、
+`export ` 前缀剥离（只认小写）、`KEY=value` / `KEY="value"`（最小 escape：`\"` `\\` `\n` `\r` `\t`，
+其余 `\x` 保留为 `\` + 字面量）/ `KEY='value'`（全字面量）/ 无引号（`=` 后剩余文本，前后空白 trim）。
+key 不合规或无 `=` 的行静默跳过；**不做** command substitution 与 `${VAR}` 展开；不支持行内 `#`
+注释与跨行值。**默认不覆盖已存在的环境变量**（direnv 兼容），`-Overload` 强制覆盖。
+
+> ADR-007：dotenv 解析器用 PowerShell 实现（`Read-PwDirDotEnv`），是对 SPEC §11「优先 Rust
+> parser」的有意偏离 —— helper 与进程 env 在同一 evaluator 内，走 native parser 需要跨进程
+> 回传 KV 且 dotenv 调用低频，复杂度不划算。
+
 ## MVP 里程碑状态
 
 | 里程碑 | 内容 | 状态 |
@@ -139,6 +167,6 @@ pwsh -NoProfile -File tests/e2e_hook.ps1
 | M2 | Evaluator（spawn pwsh、bootstrap、env capture、timeout） | ✅ |
 | M3 | Diff + Export（大小写不敏感 diff、`pwdir export --format json`） | ✅ |
 | M4 | PowerShell Module + Hook（Enable/Disable/hook、apply/restore） | ✅ |
-| M5 | stdlib（PATH_add / dotenv / watch_file / source_env / source_up） | pending |
+| M5 | stdlib（PATH_add / dotenv / watch_file / source_env / source_up） | ✅ |
 | M6 | Cache + Reload（fingerprint 快速路径） | pending |
 | M7 | exec + doctor + 打包 | pending |

@@ -54,8 +54,16 @@ function Write-PwDirEnvResult {
 }
 
 try {
-    # 步骤 2：internal metadata 命名空间（SPEC §17；M5 stdlib helper 会写入这两个集合）
-    $script:__PwDirEnvState = @{ Watches = @(); SourcedFiles = @() }
+    # 步骤 2：internal metadata 命名空间（SPEC §17）。
+    # ProjectRoot 供 stdlib helper 把相对路径解析到项目根（SPEC §9.2/§10.1：相对路径
+    # 基于 project root 而非 $PWD，RC 可能再 Set-Location）；Watches/SourcedFiles 由
+    # M5 stdlib helper 写入，JSON 形状与 pwdir-protocol（watch 项 kind/path、绝对路径
+    # 字符串数组）对齐。
+    $script:__PwDirEnvState = @{
+        ProjectRoot  = $ProjectRoot
+        Watches      = @()
+        SourcedFiles = @()
+    }
 
     # 捕获私有函数引用：RC 里定义同名函数也不得劫持结果写入通道
     $__PwDirEnvResultWriterFn = ${function:Write-PwDirEnvResult}
