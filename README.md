@@ -51,13 +51,31 @@ pwsh -NoProfile -File tests/smoke.ps1
 pwsh -NoProfile -File tests/e2e_trust.ps1
 ```
 
+## Evaluator 隔离执行模型（M2）
+
+- **隔离**：`.envrc.ps1` 永不在 Host Shell 执行。每次评估 spawn
+  `pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File bootstrap.ps1`，子进程内严格按
+  SPEC §17 十步序列运行：初始化 `$script:__PwDirEnvState` → 加载 stdlib → `Set-Location` 项目根 → dot-source RC →
+  枚举 Process environment。bootstrap 与 stdlib 在编译期嵌入二进制，运行时解包到一次性 temp 目录（用后清理），
+  路径经 argv 传递，空格 / Unicode / 特殊字符天然安全。
+- **结果通道**：结构化结果只写入 native core 分配的结果文件（同目录随机名 `.tmp` + `Move` 原子替换，UTF-8 无 BOM）。
+  RC 的 `Write-Output` / `Write-Host` / `Write-Warning` 全部留在 stdout/stderr，绝不污染协议（SPEC §7.5）；
+  native core 用两个独立线程并发排空 stdout/stderr，避免管道写满导致假超时/死锁。
+- **超时**：默认 10s（`EvaluatorConfig.timeout`，SPEC §7.6）。到点后 `taskkill /PID <pid> /T /F` 杀整棵进程树
+  （RC 可能启动了自己的子进程，仅杀 pwsh 会留孤儿），报告 `timed_out=true` 且不产出 result。
+- **错误语义**：RC 抛出终止错误时，bootstrap 写 `{ok:false, error:{kind, message, exception, stack}}` 并 exit 1；
+  结果文件缺失时（崩溃 / RC 自行 exit），native core 依据 exit code 与捕获的 stderr 构造 `no-result` 兜底错误。
+  RC 中定义同名函数也不会劫持结果写入通道（bootstrap 预先捕获写入函数引用）。
+- **实现备注**：SPEC §7.4 的 `. -LiteralPath $RcPath` 语法 pwsh 实际不接受（dot 运算符无命名参数），
+  bootstrap 以 `Get-Item -LiteralPath` 做字面量解析后 dot-source 其 FullName —— 语义等价且保留 `$PSScriptRoot`。
+
 ## MVP 里程碑状态
 
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | M0 | Scaffold（workspace / protocol schema / CLI 骨架 / PS module / ADR / CI） | ✅ |
 | M1 | Discovery + Trust（向上发现、SHA-256 trust store、allow/deny/status） | ✅ |
-| M2 | Evaluator（spawn pwsh、bootstrap、env capture、timeout） | pending |
+| M2 | Evaluator（spawn pwsh、bootstrap、env capture、timeout） | ✅ |
 | M3 | Diff + Export（大小写不敏感 diff、`pwdir export --format json`） | pending |
 | M4 | PowerShell Module + Hook（Enable/Disable/hook、apply/restore） | pending |
 | M5 | stdlib（PATH_add / dotenv / watch_file / source_env / source_up） | pending |

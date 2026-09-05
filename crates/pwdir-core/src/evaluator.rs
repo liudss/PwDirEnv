@@ -1,7 +1,388 @@
-//! Evaluator launcher：spawn 隔离 pwsh 子进程（M2 实现，ADR-002）。
+//! Evaluator launcher：spawn 隔离 pwsh 子进程执行 RC（M2，ADR-002 / SPEC §7）。
+//!
+//! 执行模型（SPEC §7）：
+//! - `pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy <policy> -File bootstrap.ps1`
+//!   子进程内按 §17 十步序列：init state → stdlib → Set-Location → dot-source RC → 枚举 env。
+//! - 结果通道：bootstrap 把结构化 JSON 写入 native core 分配的结果文件
+//!   （同目录 `.tmp` + atomic rename），协议结果绝不与 stdout/stderr 混用（§7.5）。
+//! - 超时（§7.6）：`wait_timeout` 到点后 `taskkill /T /F` 杀整个进程树。
+//!
+//! bootstrap.ps1 / stdlib.ps1 在编译期 `include_str!` 嵌入二进制，运行时解包到
+//! 一次性 temp 目录 —— 部署后仓库目录可能不存在，`-File` 不能依赖源码相对路径。
 
-/// TODO(M2): spawn `pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File bootstrap.ps1`、
-/// 临时结果文件通道、超时 kill 进程树、结构化 diagnostics 收集。
-pub fn placeholder() -> u32 {
-    0
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::Deserialize;
+use wait_timeout::ChildExt;
+
+use pwdir_protocol::{DiscoveredRc, EvaluationError, EvaluationResult};
+
+use crate::PwDirError;
+
+// include_str! 相对路径基于本 .rs 文件位置：src/ → pwdir-core → crates → 仓库根/evaluator
+/// bootstrap.ps1（SPEC §17 十步序列）。UTF-8 无 BOM 落盘后由 `pwsh -File` 执行。
+const BOOTSTRAP_PS1: &str = include_str!("../../../evaluator/bootstrap.ps1");
+/// stdlib.ps1（M5 前为骨架，但必须可被 bootstrap dot-source）。
+const STDLIB_PS1: &str = include_str!("../../../evaluator/stdlib.ps1");
+
+/// evaluator 启动配置。默认值对齐 SPEC §7.2/§7.6。
+#[derive(Debug, Clone)]
+pub struct EvaluatorConfig {
+    /// pwsh 可执行文件名或路径（默认 `pwsh`，要求 PowerShell 7+）。
+    pub pwsh: String,
+    /// 超时上限，默认 10s（SPEC §7.6）。
+    pub timeout: Duration,
+    /// `-ExecutionPolicy` 参数，仅作用于本次 evaluator 进程。
+    pub execution_policy: String,
+}
+
+impl Default for EvaluatorConfig {
+    fn default() -> Self {
+        Self {
+            pwsh: "pwsh".to_string(),
+            timeout: Duration::from_secs(10),
+            execution_policy: "Bypass".to_string(),
+        }
+    }
+}
+
+/// 一次 evaluation 的完整报告：成功时 `result` 为 Some；失败/超时时 `error` 为 Some。
+/// stdout/stderr 原样保留（diagnostics 素材），与结构化结果互不干扰。
+#[derive(Debug, Clone, Default)]
+pub struct EvaluationReport {
+    pub result: Option<EvaluationResult>,
+    pub error: Option<EvaluationError>,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration: Duration,
+    pub timed_out: bool,
+}
+
+/// 一次性工作目录命名用的进程内序列号（配合 pid + 纳秒时间戳防碰撞）。
+static WORK_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn unique_tag() -> String {
+    let seq = WORK_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos:x}-{seq:x}", std::process::id())
+}
+
+/// 创建一次性工作目录：`%TEMP%/PwDirEnv-<pid>-<nanos>-<seq>/`（SPEC §18.4：当前用户专用目录）。
+fn create_work_dir() -> Result<PathBuf, PwDirError> {
+    let dir = std::env::temp_dir().join(format!("PwDirEnv-{}", unique_tag()));
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// 执行一次 RC evaluation（SPEC §7.1：Host 永不执行 RC，只在隔离子进程中执行）。
+///
+/// `Err` 仅表示基础设施失败（pwsh 不存在、temp 目录不可写等，`PwDirError::Io`）；
+/// RC 本身的 throw / 超时属于"评估结果"，通过 [`EvaluationReport::error`] 返回。
+pub fn evaluate(cfg: &EvaluatorConfig, rc: &DiscoveredRc) -> Result<EvaluationReport, PwDirError> {
+    let started = Instant::now();
+    let work_dir = create_work_dir()?;
+    let report = run(cfg, rc, &work_dir, started);
+    // best-effort 清理一次性目录：结果已读入内存，残留不影响正确性（consume 后删除，§18.4）
+    let _ = fs::remove_dir_all(&work_dir);
+    report
+}
+
+fn run(
+    cfg: &EvaluatorConfig,
+    rc: &DiscoveredRc,
+    work_dir: &Path,
+    started: Instant,
+) -> Result<EvaluationReport, PwDirError> {
+    // 1. 解包嵌入脚本 + 分配结果文件路径（工作目录本身全新且不可预测，天然无同名冲突）
+    let bootstrap_path = work_dir.join("bootstrap.ps1");
+    let stdlib_path = work_dir.join("stdlib.ps1");
+    let result_path = work_dir.join(format!("result-{}.json", unique_tag()));
+    debug_assert!(!result_path.exists());
+    // fs::write 写原始字节（&str 即 UTF-8、无 BOM），供 pwsh 按 UTF-8 读取
+    fs::write(&bootstrap_path, BOOTSTRAP_PS1)?;
+    fs::write(&stdlib_path, STDLIB_PS1)?;
+
+    // 2. 构造命令。路径经 argv 传递，空格/Unicode 天然安全；
+    //    current_dir 不设置 —— 继承 pwdir.exe 的（即 Host 当前，SPEC §7.3）。
+    let mut command = Command::new(&cfg.pwsh);
+    command
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg(&cfg.execution_policy)
+        .arg("-File")
+        .arg(&bootstrap_path)
+        .arg("-RcPath")
+        .arg(&rc.rc_path)
+        .arg("-ProjectRoot")
+        .arg(&rc.project_root)
+        .arg("-ResultPath")
+        .arg(&result_path)
+        .arg("-StdlibPath")
+        .arg(&stdlib_path);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PwDirError::Io(std::io::Error::other(format!(
+                "pwsh executable {:?} not found on PATH; install PowerShell 7+ or point evaluator config at a valid pwsh path",
+                cfg.pwsh
+            ))));
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // 3. spawn 后立即用两个线程分别 drain stdout/stderr：
+    //    若不并发排空，子进程写满管道缓冲区后会阻塞在 Write 上直到超时（假超时/死锁形态）。
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| missing_pipe_error("stdout"))?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| missing_pipe_error("stderr"))?;
+    let stdout_handle = thread::spawn(move || drain_to_string(stdout_pipe));
+    let stderr_handle = thread::spawn(move || drain_to_string(stderr_pipe));
+
+    // 4. 带超时等待；到点杀整棵进程树
+    let mut timed_out = false;
+    let status = match child.wait_timeout(cfg.timeout)? {
+        Some(status) => status,
+        None => {
+            timed_out = true;
+            kill_process_tree(&mut child);
+            child.wait()?
+        }
+    };
+
+    // 子进程已退出，管道写端关闭，drain 线程必然到达 EOF
+    let stdout = stdout_handle
+        .join()
+        .unwrap_or_else(|_| String::from("<stdout drain thread panicked>"));
+    let stderr = stderr_handle
+        .join()
+        .unwrap_or_else(|_| String::from("<stderr drain thread panicked>"));
+
+    // 5. 读结果文件并按 ok 字段分流
+    let exit_code = status.code();
+    let (result, error) = match fs::read_to_string(&result_path) {
+        Ok(raw) => parse_result_file(&raw),
+        Err(_) => (None, Some(fallback_error(timed_out, exit_code, &stderr))),
+    };
+
+    // 6. 汇总报告；temp 目录由调用方清理
+    Ok(EvaluationReport {
+        result,
+        error,
+        exit_code,
+        stdout,
+        stderr,
+        duration: started.elapsed(),
+        timed_out,
+    })
+}
+
+fn missing_pipe_error(which: &str) -> PwDirError {
+    PwDirError::Io(std::io::Error::other(format!(
+        "evaluator child process did not provide a {which} pipe"
+    )))
+}
+
+/// 排空管道为 String。pwsh 输出按控制台编码（Windows 上通常 UTF-8）；
+/// 无法解码的字节做有损替换 —— 诊断通道允许 lossy，协议通道在结果文件里。
+fn drain_to_string(mut pipe: impl Read) -> String {
+    let mut buf = Vec::new();
+    let _ = pipe.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// 超时后杀整棵进程树（SPEC §7.6 "kill process tree"）。
+///
+/// Windows 上必须 `taskkill /T /F`：RC 可能启动了自己的子进程，仅 kill pwsh
+/// 会留下孤儿且不关闭继承的管道写端，drain 线程将永远等不到 EOF。
+#[cfg(windows)]
+fn kill_process_tree(child: &mut Child) {
+    let pid = child.id().to_string();
+    let _ = Command::new("taskkill.exe")
+        .arg("/PID")
+        .arg(pid)
+        .arg("/T")
+        .arg("/F")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.wait();
+}
+
+#[cfg(not(windows))]
+fn kill_process_tree(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// bootstrap 错误信封（`{ ok: false, error: {...} }`）。
+#[derive(Deserialize)]
+struct ErrorEnvelope {
+    #[serde(default)]
+    error: Option<EvaluationError>,
+}
+
+/// 解析 bootstrap 产物：按顶层 `ok` 字段分流成 EvaluationResult / EvaluationError。
+fn parse_result_file(raw: &str) -> (Option<EvaluationResult>, Option<EvaluationError>) {
+    let value: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                None,
+                Some(EvaluationError {
+                    kind: "protocol-invalid".to_string(),
+                    message: format!("evaluator result file is not valid JSON: {e}"),
+                    exception: None,
+                    stack: None,
+                }),
+            );
+        }
+    };
+
+    let ok = value
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    if ok {
+        // 信封里的 schema/ok 为额外字段，serde 默认忽略；只取协议字段
+        match serde_json::from_value::<EvaluationResult>(value) {
+            Ok(result) => (Some(result), None),
+            Err(e) => (
+                None,
+                Some(EvaluationError {
+                    kind: "protocol-invalid".to_string(),
+                    message: format!("evaluator result file does not match protocol schema: {e}"),
+                    exception: None,
+                    stack: None,
+                }),
+            ),
+        }
+    } else {
+        let error = match serde_json::from_value::<ErrorEnvelope>(value) {
+            Ok(ErrorEnvelope { error: Some(error) }) => error,
+            _ => EvaluationError {
+                kind: "evaluation-failed".to_string(),
+                message: "evaluator reported failure without structured error details".to_string(),
+                exception: None,
+                stack: None,
+            },
+        };
+        (None, Some(error))
+    }
+}
+
+/// 结果文件缺失（崩溃 / 被 RC exit / 超时杀树）时的兜底错误。
+fn fallback_error(timed_out: bool, exit_code: Option<i32>, stderr: &str) -> EvaluationError {
+    if timed_out {
+        return EvaluationError {
+            kind: "timeout".to_string(),
+            message:
+                "evaluator timed out; the process tree was killed before a result file was written"
+                    .to_string(),
+            exception: None,
+            stack: None,
+        };
+    }
+    // stderr 末尾往往有 pwsh 的崩溃线索；截尾避免错误消息爆炸
+    let hint = stderr.lines().rev().find(|l| !l.trim().is_empty());
+    let hint = hint.map(|l| l.trim()).unwrap_or_default();
+    let hint = if hint.len() > 200 { &hint[..200] } else { hint };
+    EvaluationError {
+        kind: "no-result".to_string(),
+        message: format!(
+            "evaluator exited with code {exit_code:?} without writing a result file; last stderr line: {hint}"
+        ),
+        exception: None,
+        stack: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    use pwdir_protocol::WatchDependency;
+
+    #[test]
+    fn default_config_matches_spec() {
+        let cfg = EvaluatorConfig::default();
+        assert_eq!(cfg.pwsh, "pwsh");
+        assert_eq!(cfg.timeout, Duration::from_secs(10));
+        assert_eq!(cfg.execution_policy, "Bypass");
+    }
+
+    #[test]
+    fn parse_result_file_routes_by_ok_field() {
+        let ok_payload = r#"{
+            "schema": 1, "ok": true,
+            "environment": {"vars": {"FOO": "bar"}},
+            "watches": [{"kind": "file", "path": "C:\\x\\package.json"}],
+            "sourced_files": [], "diagnostics": []
+        }"#;
+        let (result, error) = parse_result_file(ok_payload);
+        assert!(error.is_none());
+        let result = result.expect("ok payload yields result");
+        assert_eq!(
+            result.environment.get_canonical("FOO").map(OsString::from),
+            Some(OsString::from("bar"))
+        );
+        assert_eq!(
+            result.watches,
+            vec![WatchDependency::File(PathBuf::from("C:\\x\\package.json"))]
+        );
+
+        let err_payload = r#"{
+            "schema": 1, "ok": false,
+            "error": {"kind": "evaluation-failed", "message": "boom",
+                      "exception": "System.Management.Automation.RuntimeException", "stack": "at <ScriptBlock>"}
+        }"#;
+        let (result, error) = parse_result_file(err_payload);
+        assert!(result.is_none());
+        let error = error.expect("error payload yields error");
+        assert_eq!(error.kind, "evaluation-failed");
+        assert_eq!(error.message, "boom");
+    }
+
+    #[test]
+    fn parse_result_file_reports_invalid_json() {
+        let (result, error) = parse_result_file("not json at all");
+        assert!(result.is_none());
+        let error = error.expect("invalid json yields error");
+        assert_eq!(error.kind, "protocol-invalid");
+    }
+
+    #[test]
+    fn fallback_error_for_timeout_and_missing_result() {
+        let e1 = fallback_error(true, None, "");
+        assert_eq!(e1.kind, "timeout");
+
+        let e2 = fallback_error(false, Some(1), "boom\r\nat line 1");
+        assert_eq!(e2.kind, "no-result");
+        assert!(e2.message.contains("Some(1)"));
+        assert!(e2.message.contains("at line 1"));
+    }
 }

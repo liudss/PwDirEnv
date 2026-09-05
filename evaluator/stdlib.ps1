@@ -2,10 +2,13 @@
 # PwDirEnv stdlib（SPEC §10）：在 RC dot-source 之前由 bootstrap.ps1 加载，为 RC 提供 direnv 风格 helper。
 # 内部 metadata 变量使用 __PwDirEnvState 命名空间，避免与 RC 用户变量冲突（SPEC §17）。
 
-$script:__PwDirEnvState = @{
-    Watches      = [System.Collections.Generic.List[object]]::new()  # WatchDependency 列表
-    SourcedFiles = [System.Collections.Generic.List[string]]::new()  # 已 source 的文件
-    ProjectRoot  = $null                                             # 由 bootstrap 注入
+# 兜底初始化：bootstrap 步骤 2 已初始化 $script:__PwDirEnvState（dot-source 共享同一 script scope），
+# 这里再防一次独立加载 / 未初始化场景，保证 helper 始终有可写的集合。
+if ($null -eq $script:__PwDirEnvState) {
+    $script:__PwDirEnvState = @{
+        Watches      = @()
+        SourcedFiles = @()
+    }
 }
 
 # TODO(M5): 以下 helper 将在 M5 实现（当前为骨架占位，函数体随 M5 交付）：
