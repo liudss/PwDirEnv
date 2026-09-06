@@ -15,6 +15,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::LazyLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -81,6 +82,10 @@ pub struct EvaluationReport {
     pub duration: Duration,
     pub timed_out: bool,
 }
+
+/// 超时清理（taskkill、父进程回收和诊断管道）都必须有自己的上限。RC 不可信，
+/// 不能让“超时处理”本身重新变成无界等待。
+const TIMEOUT_CLEANUP_LIMIT: Duration = Duration::from_secs(5);
 
 /// 一次性工作目录命名用的进程内序列号（配合 pid + 纳秒时间戳防碰撞）。
 static WORK_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -174,8 +179,14 @@ fn run(
         .stderr
         .take()
         .ok_or_else(|| missing_pipe_error("stderr"))?;
-    let stdout_handle = thread::spawn(move || drain_to_string(stdout_pipe));
-    let stderr_handle = thread::spawn(move || drain_to_string(stderr_pipe));
+    let (stdout_tx, stdout_rx) = mpsc::sync_channel(1);
+    let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = stdout_tx.send(drain_to_string(stdout_pipe));
+    });
+    thread::spawn(move || {
+        let _ = stderr_tx.send(drain_to_string(stderr_pipe));
+    });
 
     // 4. 带超时等待；到点杀整棵进程树
     let mut timed_out = false;
@@ -184,17 +195,22 @@ fn run(
         None => {
             timed_out = true;
             kill_process_tree(&mut child);
-            child.wait()?
+            // `taskkill` 可能因为系统服务或权限问题卡住/失败；即使如此也要直接
+            // 终止 evaluator 本身，并把等待限制在清理窗口内。
+            match child.wait_timeout(TIMEOUT_CLEANUP_LIMIT)? {
+                Some(status) => status,
+                None => {
+                    let _ = child.kill();
+                    child.wait()?
+                }
+            }
         }
     };
 
-    // 子进程已退出，管道写端关闭，drain 线程必然到达 EOF
-    let stdout = stdout_handle
-        .join()
-        .unwrap_or_else(|_| String::from("<stdout drain thread panicked>"));
-    let stderr = stderr_handle
-        .join()
-        .unwrap_or_else(|_| String::from("<stderr drain thread panicked>"));
+    // 正常退出时等待完整诊断输出。超时路径中，RC 的孤儿进程可能仍持有继承的
+    // stdout/stderr 写端；因此只能在有限窗口内收集，绝不能让 drain 永久阻塞返回。
+    let stdout = receive_drain(stdout_rx, timed_out, "stdout");
+    let stderr = receive_drain(stderr_rx, timed_out, "stderr");
 
     // 5. 读结果文件并按 ok 字段分流
     let exit_code = status.code();
@@ -213,6 +229,15 @@ fn run(
         duration: started.elapsed(),
         timed_out,
     })
+}
+
+fn receive_drain(rx: mpsc::Receiver<String>, timed_out: bool, stream: &str) -> String {
+    let result = if timed_out {
+        rx.recv_timeout(TIMEOUT_CLEANUP_LIMIT).ok()
+    } else {
+        rx.recv().ok()
+    };
+    result.unwrap_or_else(|| format!("<{stream} drain unavailable after evaluator timeout>"))
 }
 
 /// 管道缺失的统一错误（evaluator 与 exec 共用）。
@@ -238,7 +263,9 @@ pub(crate) fn drain_to_string(mut pipe: impl Read) -> String {
 #[cfg(windows)]
 fn kill_process_tree(child: &mut Child) {
     let pid = child.id().to_string();
-    let _ = Command::new("taskkill.exe")
+    // 不用 `.status()`：taskkill 自己也可能在系统调用中卡住，导致原本有上限的
+    // evaluator timeout 变成无限等待。清理命令在自己的有限窗口内运行。
+    let killer = Command::new("taskkill.exe")
         .arg("/PID")
         .arg(pid)
         .arg("/T")
@@ -246,14 +273,26 @@ fn kill_process_tree(child: &mut Child) {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
-    let _ = child.wait();
+        .spawn();
+    if let Ok(mut killer) = killer {
+        match killer.wait_timeout(TIMEOUT_CLEANUP_LIMIT) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                let _ = killer.kill();
+                let _ = killer.wait();
+            }
+            Err(_) => {
+                let _ = killer.kill();
+            }
+        }
+    }
+    // taskkill 是“整树”清理；直接 kill 是它失败时保证 evaluator 父进程能退出的兜底。
+    let _ = child.kill();
 }
 
 #[cfg(not(windows))]
 fn kill_process_tree(child: &mut Child) {
     let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// bootstrap 错误信封（`{ ok: false, error: {...} }`）。
