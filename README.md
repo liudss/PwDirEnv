@@ -257,3 +257,38 @@ pwsh -NoProfile -File packaging\install.ps1 -SkipBuild # 复用现有 target\rel
 拷贝到 InstallRoot 后打印后续步骤（① bin 加 PATH 或设 `PWDIRENV_EXE`；② Import-Module；
 ③ `pwdir hook install --yes`）—— **不自动修改系统/用户 PATH**（最小侵入）。
 winget manifest 占位见 `packaging/winget/`（正式发布流程不在仓库范围）。
+
+## MVP Definition of Done 核验（SPEC §26）
+
+以下逐条对应 SPEC §26 的 17 项 MVP DoD，均在 Windows 11 + PowerShell 7.6.5 实测：
+
+| # | DoD 项 | 验证方式 / 证据 |
+|---|---|---|
+| 1 | Windows 10/11 + PowerShell 7.4 可安装运行 | 要求 `#requires -Version 7.2`；本机 7.6.5 全流程通过；`doctor` 对 <7.2 报 Warn/Fail |
+| 2 | `.envrc.ps1` 是合法 PowerShell，允许 `$env:` 修改 | evaluator 直接 dot-source 任意合法 PS 脚本（M2/M3 fixtures） |
+| 3 | 未 allow 时绝不执行 | `evaluator`/`export`/`exec` 三处 trust 门禁；`blocked` 时 patch 恒空、RC 一行不执行 |
+| 4 | RC 修改后重新 blocked | 内容 SHA-256，改一个 byte 即 blocked（`e2e_trust.ps1` 实测） |
+| 5 | Host Shell 不 dot-source RC | ADR-002：评估只在隔离子进程；Host 只应用 JSON patch（`Invoke-PwDirNative`） |
+| 6 | evaluator stdout/stderr 不污染协议 | 结果走独立结果文件；Write-Output/Write-Host 噪音 fixtures 全过 |
+| 7 | set/update/unset 精确捕获 | `diff_env` 单测 + `export_integration`（set+unset 组合） |
+| 8 | 离开目录恢复原值（含原已存在） | `e2e_hook.ps1`：A→B→outside 恢复、手动改值后离开也恢复 |
+| 9 | PATH 不发生重复累积 | `PATH_add` 等价项去重移前单测 + stdlib_integration |
+| 10 | PATH_add/dotenv/watch_file/source_env/source_up 可用 | `stdlib_integration` 11 条全过 |
+| 11 | watch 变化自动 reload | `cache_integration`：watch 文件变化 → 重新评估 |
+| 12 | exec argv-safe | `exec_integration`（含 exit code 传播 7） |
+| 13 | 路径含空格/Unicode/单引号/方括号/`$` 通过 E2E | `tests/e2e_path_torture.ps1`（全 hook 链） |
+| 14 | 用户 prompt 被完整保留 | `e2e_hook.ps1`：自定义 prompt 启用/禁用前后不变 |
+| 15 | evaluator error/timeout 不破坏 shell | timeout 测试 + hook catch-all（§13.4） |
+| 16 | 只由 module 修改 Process environment | 全程 `EnvironmentVariableTarget.Process`，不触 User/Machine（ADR-006） |
+| 17 | release blocker 测试在 CI 通过 | 本机 `cargo test --workspace` 134 全绿；`.github/workflows/ci.yml` 已配置 Windows CI |
+
+路径强制验收脚本：
+
+```powershell
+pwsh -NoProfile -File tests/e2e_path_torture.ps1   # 空格/引号/Unicode/方括号/$ 路径全 hook 链
+```
+
+## 后续（M8，Phase 2，不在 MVP）
+
+layout providers、`watch_dir` 深度指纹、并发多 shell 基准、性能 benchmark 脚本、secret vault、
+多 shell 前端（nushell/cmd）等 —— 见 SPEC §23 对标矩阵的 Phase 2 列，按需开展。
