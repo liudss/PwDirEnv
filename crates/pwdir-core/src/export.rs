@@ -83,18 +83,7 @@ pub fn export_with_store(
 
     // 3. trust 校验：blocked 时 patch 恒为空 —— RC 内容一行都不执行（安全边界 > 一切）
     if !store.is_allowed(&rc.rc_path)? {
-        return Ok(ExportOutput {
-            schema: PROTOCOL_SCHEMA,
-            action: Action::Blocked,
-            rc: Some(rc.rc_path),
-            patch: Default::default(),
-            managed_keys: vec![],
-            fingerprint: None,
-            diagnostics: vec![Diagnostic {
-                level: "warn".to_string(),
-                message: "rc file is blocked; run `pwdir allow`".to_string(),
-            }],
-        });
+        return Ok(blocked_output(&rc.rc_path));
     }
 
     // 4. fingerprint 快速路径（M6）：trust 已通过，cache 指纹仍与现实一致 → noop 不 spawn。
@@ -121,6 +110,13 @@ pub fn export_with_store(
     // 5. 隔离评估。Err（基础设施故障）直接向上传播，CLI 按退出码映射处理
     let versions = evaluator::embedded_script_versions();
     let report = evaluator::evaluate(cfg, &rc)?;
+
+    // evaluator 运行期间 RC 可能被编辑或替换。此时 evaluation result 对应的是
+    // 旧内容，绝不能以新内容的 fingerprint 写入 cache，更不能把旧 patch 应用到 Host。
+    // 重新验证授权会同时校验当前 bytes 是否仍是 allow 时的内容。
+    if !store.is_allowed(&rc.rc_path)? {
+        return Ok(blocked_output(&rc.rc_path));
+    }
 
     match (report.result, report.error) {
         // 成功 → 计算 fingerprint、写 cache（原子替换）、diff 出 patch
@@ -180,6 +176,22 @@ pub fn export_with_store(
                 message: "evaluator produced neither a result nor an error".to_string(),
             }],
         }),
+    }
+}
+
+/// 未授权（或在 evaluation 期间发生内容变化）的 RC 统一返回安全的空 patch。
+fn blocked_output(rc_path: &Path) -> ExportOutput {
+    ExportOutput {
+        schema: PROTOCOL_SCHEMA,
+        action: Action::Blocked,
+        rc: Some(rc_path.to_path_buf()),
+        patch: Default::default(),
+        managed_keys: vec![],
+        fingerprint: None,
+        diagnostics: vec![Diagnostic {
+            level: "warn".to_string(),
+            message: "rc file is blocked; run `pwdir allow`".to_string(),
+        }],
     }
 }
 
@@ -370,6 +382,37 @@ mod tests {
 
         assert_eq!(out.action, Action::Blocked);
         assert!(out.patch.is_empty());
+    }
+
+    #[test]
+    fn rc_changed_during_evaluation_is_blocked_without_caching_stale_result() {
+        ensure_pwsh();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rc_path = tmp.path().join(RC_FILENAME);
+        let rc = write_rc(
+            tmp.path(),
+            &format!(
+                "$env:PWDIR_RACE_GUARD = 'old'\nSet-Content -LiteralPath '{}' -Value \"`$env:PWDIR_RACE_GUARD = 'new'\"\n",
+                rc_path.display()
+            ),
+        );
+        let (store, cache, _guard) = temp_stores();
+        store.allow(&rc).expect("allow");
+
+        let out = export_with_store(
+            tmp.path(),
+            &EvaluatorConfig::default(),
+            &store,
+            &cache,
+            true,
+        )
+        .expect("export returns protocol output");
+
+        assert_eq!(out.action, Action::Blocked);
+        assert!(out.patch.is_empty(), "stale evaluator patch must not escape");
+        assert!(out.fingerprint.is_none());
+        assert!(cache.load(&rc).expect("cache load").is_none());
+        std::env::remove_var("PWDIR_RACE_GUARD");
     }
 
     #[test]

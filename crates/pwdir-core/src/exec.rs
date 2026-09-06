@@ -87,6 +87,13 @@ pub fn run_exec_with_store(
         let report = evaluator::evaluate(&exec_cfg, rc)?;
         match (report.result, report.error) {
             (Some(result), _) => {
+                // RC 若在 evaluator 运行期间被修改，result 与当前受信内容不再对应；
+                // 此时禁止启动目标命令，避免把过期 patch 当成已授权配置使用。
+                if !store.is_allowed(&rc.rc_path)? {
+                    return Err(PwDirError::NotAllowed(
+                        "rc changed during evaluation; run `pwdir allow`".to_string(),
+                    ));
+                }
                 let baseline = EnvironmentSnapshot::from_process();
                 diff_env(&baseline, &result.environment)
             }

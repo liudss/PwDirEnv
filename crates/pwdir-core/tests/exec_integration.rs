@@ -271,6 +271,40 @@ fn exec_throwing_rc_is_evaluation_failed() {
 }
 
 #[test]
+fn exec_does_not_spawn_command_when_rc_changes_during_evaluation() {
+    ensure_pwsh();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let rc_path = tmp.path().join(RC_FILENAME);
+    let rc = write_rc(
+        tmp.path(),
+        &format!(
+            "$env:PW_EXEC_RACE = 'old'\nSet-Content -LiteralPath '{}' -Value \"`$env:PW_EXEC_RACE = 'new'\"\n",
+            rc_path.display()
+        ),
+    );
+    let (store, _guard) = temp_store();
+    store.allow(&rc).expect("allow rc");
+    let marker = tmp.path().join("command-ran.marker");
+
+    let err = run_exec_with_store(
+        tmp.path(),
+        "pwsh",
+        &strings(&[
+            "-NoProfile",
+            "-Command",
+            &format!("Set-Content -LiteralPath '{}' -Value ran", marker.display()),
+        ]),
+        false,
+        &EvaluatorConfig::default(),
+        &store,
+    )
+    .expect_err("changed RC must block exec");
+
+    assert!(matches!(err, PwDirError::NotAllowed(_)));
+    assert!(!marker.exists(), "command must not spawn with a stale RC patch");
+}
+
+#[test]
 fn exec_missing_command_is_friendly_io_error() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (store, _guard) = temp_store();
