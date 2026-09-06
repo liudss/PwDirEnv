@@ -327,7 +327,6 @@ function Enable-PwDirEnv {
     }
 
     $script:PwDirState.Enabled = $true
-    Write-PwDirLog info 'enabled'
 }
 
 function Disable-PwDirEnv {
