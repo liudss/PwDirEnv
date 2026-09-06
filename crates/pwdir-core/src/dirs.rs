@@ -20,7 +20,9 @@ pub fn pwdir_data_root_with(base: Option<&Path>) -> Result<PathBuf, PwDirError> 
     let root = match base {
         Some(explicit) => explicit.to_path_buf(),
         None => match std::env::var_os("LOCALAPPDATA") {
-            Some(value) if !value.is_empty() => PathBuf::from(value),
+            // LOCALAPPDATA 是共享父目录；所有 PwDirEnv 状态必须收敛在自身
+            // 子目录中，不能在其根下创建 allow/cache/state。
+            Some(value) if !value.is_empty() => local_app_data_root(Path::new(&value)),
             _ => match std::env::var_os("USERPROFILE") {
                 Some(home) if !home.is_empty() => PathBuf::from(home).join(".pwdir"),
                 // 两个变量都缺失/为空：无法定位合理的用户目录，显式报错
@@ -38,6 +40,10 @@ pub fn pwdir_data_root_with(base: Option<&Path>) -> Result<PathBuf, PwDirError> 
         fs::create_dir_all(root.join(sub))?;
     }
     Ok(root)
+}
+
+fn local_app_data_root(local_app_data: &Path) -> PathBuf {
+    local_app_data.join("PwDirEnv")
 }
 
 /// 生产入口：从环境解析数据根目录。
@@ -84,11 +90,11 @@ mod tests {
     }
 
     #[test]
-    fn convenience_dirs_live_under_default_root() {
-        // 走真实环境解析（通常 %LOCALAPPDATA%）；仅验证便捷函数与根目录一致
-        let root = pwdir_data_root().expect("data root");
-        assert_eq!(allow_dir().expect("allow dir"), root.join("allow"));
-        assert_eq!(cache_dir().expect("cache dir"), root.join("cache"));
-        assert_eq!(state_dir().expect("state dir"), root.join("state"));
+    fn local_app_data_uses_product_subdirectory() {
+        assert_eq!(
+            local_app_data_root(Path::new(r"C:\Users\alice\AppData\Local")),
+            PathBuf::from(r"C:\Users\alice\AppData\Local\PwDirEnv")
+        );
     }
+
 }

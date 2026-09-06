@@ -117,6 +117,27 @@ try {
     if ($env:PWDIR_E2E -ne 'A') { throw "step f: expected 'A', got '$($env:PWDIR_E2E)'" }
     Write-Ok 'f. cd A again: second load works'
 
+    # f2) 子 pwsh 继承 PWDIRENV_CONTEXT：同一 RC 的首次 hook 只走 native
+    # fingerprint fast path，不应再次 force evaluator / 输出 loading；随后离开项目
+    # 仍须按继承的 baseline 卸载环境（direnv DIRENV_DIFF 等价语义）。
+    $childScript = @"
+`$InformationPreference = 'SilentlyContinue'
+Import-Module '$($repoRoot.Replace("'", "''"))\powershell\PwDirEnv\PwDirEnv.psd1' -Force
+Enable-PwDirEnv -PwDirPath '$($pwdir.Replace("'", "''"))'
+Invoke-PwDirEnvHook 6>`$null
+`$s = Get-PwDirEnvStatus
+if (`$s.ActiveRc -ne '$($rcA.Replace("'", "''"))') { throw "child ActiveRc mismatch: `$(`$s.ActiveRc)" }
+if (`$env:PWDIR_E2E -ne 'A') { throw "child did not inherit A environment: `$env:PWDIR_E2E" }
+Set-Location -LiteralPath '$($dirOut.Replace("'", "''"))'
+Invoke-PwDirEnvHook 6>`$null
+if (`$null -ne `$env:PWDIR_E2E -or `$null -ne `$env:PWDIR_E2E_A_ONLY) { throw 'child did not restore inherited baseline on leave' }
+"@
+    $encodedChild = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
+    $childLogs = Get-LogText (& pwsh -NoLogo -NoProfile -NonInteractive -EncodedCommand $encodedChild 6>&1)
+    if ($LASTEXITCODE -ne 0) { throw "nested child pwsh failed (exit $LASTEXITCODE): $childLogs" }
+    if ($childLogs -match 'pwdir: loading') { throw "nested child unexpectedly reloaded RC: $childLogs" }
+    Write-Ok 'f2. nested pwsh inherited context: no reload; leaving restored baseline'
+
     # g) 篡改 A 的 RC（改一个 byte）→ trust 失效 → blocked → last-known-good 保持，不抛错
     Set-Content -LiteralPath $rcA -Value @'
 $env:PWDIR_E2E = 'A-tampered'

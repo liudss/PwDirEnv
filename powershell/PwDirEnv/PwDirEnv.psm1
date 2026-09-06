@@ -47,6 +47,11 @@ $script:AbsentMarker = [Guid]::NewGuid().ToString()
 # （典型场景：模块被 Import-Module -Force 重载导致 script 状态丢失后再次 Enable）。
 $script:PromptMarker = '__PwDirEnv_prompt_wrapper__'
 
+# 可继承的会话上下文（direnv 的 DIRENV_DIFF 对应物）。它不是 RC 的输入，
+# 而是 Host 用来让子 pwsh 恢复“已加载项目 + 原始 baseline”的私有元数据。
+$script:ContextVariable = 'PWDIRENV_CONTEXT'
+$script:ContextSchema = 1
+
 # ---------------------------------------------------------------------------
 # 内部函数（不导出）
 # ---------------------------------------------------------------------------
@@ -168,6 +173,80 @@ function Remove-PwDirProcessEnvVar {
     [Environment]::SetEnvironmentVariable($Name, [NullString]::Value, 'Process')
 }
 
+function Export-PwDirContext {
+    <# 把当前 Host 的恢复信息编码到 Process 环境。子 pwsh 会继承它，从而在同一
+       RC 的指纹快速路径命中时不把自己误判成“首次加载”。不保存 secret 之外的
+       环境全量，只保存本模块已经拥有的 baseline / managed-key 元数据。 #>
+    if ([string]::IsNullOrEmpty($script:PwDirState.ActiveRc)) {
+        Remove-PwDirProcessEnvVar $script:ContextVariable
+        return
+    }
+
+    $baseline = [ordered]@{}
+    foreach ($key in @($script:PwDirState.Baseline.Keys)) {
+        $entry = $script:PwDirState.Baseline[$key]
+        $value = if ($entry.Existed) { [string]$entry.Value } else { $null }
+        $baseline[$key] = [ordered]@{ existed = [bool]$entry.Existed; value = $value }
+    }
+    $applied = [ordered]@{}
+    foreach ($key in @($script:PwDirState.Applied.Keys)) {
+        $value = $script:PwDirState.Applied[$key]
+        $exists = ($value -ne $script:AbsentMarker)
+        $applied[$key] = [ordered]@{
+            exists = $exists
+            value = if ($exists) { [string]$value } else { $null }
+        }
+    }
+    $payload = [ordered]@{
+        schema = $script:ContextSchema
+        rc = [string]$script:PwDirState.ActiveRc
+        baseline = $baseline
+        applied = $applied
+    }
+    $json = $payload | ConvertTo-Json -Depth 8 -Compress
+    $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+    [Environment]::SetEnvironmentVariable(
+        $script:ContextVariable,
+        [Convert]::ToBase64String($bytes),
+        'Process'
+    )
+}
+
+function Import-PwDirContext {
+    <# 尽力恢复父 shell 的上下文。恶意/损坏的环境变量一律忽略，随后 native
+       export 仍会执行 trust 与 fingerprint 校验；因此此变量不是安全授权凭据。 #>
+    $raw = [Environment]::GetEnvironmentVariable($script:ContextVariable, 'Process')
+    if ([string]::IsNullOrWhiteSpace($raw)) { return }
+    try {
+        $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($raw))
+        $payload = $json | ConvertFrom-Json
+        if ($payload.schema -ne $script:ContextSchema -or [string]::IsNullOrWhiteSpace([string]$payload.rc)) {
+            return
+        }
+
+        foreach ($prop in @($payload.baseline.PSObject.Properties)) {
+            $entry = $prop.Value
+            $existed = [bool]$entry.existed
+            $script:PwDirState.Baseline[[string]$prop.Name] = [pscustomobject]@{
+                Existed = $existed
+                Value = if ($existed) { [string]$entry.value } else { $null }
+            }
+        }
+        foreach ($prop in @($payload.applied.PSObject.Properties)) {
+            $entry = $prop.Value
+            $script:PwDirState.Applied[[string]$prop.Name] = if ([bool]$entry.exists) {
+                [string]$entry.value
+            } else {
+                $script:AbsentMarker
+            }
+        }
+        $script:PwDirState.ActiveRc = [string]$payload.rc
+    }
+    catch {
+        # private context 仅是性能/恢复优化；解析失败绝不能阻断 shell startup。
+    }
+}
+
 function Apply-PwDirPatch {
     <#
         把 ExportOutput.patch 应用到 Process scope（SPEC §15.1）。
@@ -230,6 +309,7 @@ function Restore-PwDirEnvironment {
     $script:PwDirState.Baseline.Clear()
     $script:PwDirState.Applied.Clear()
     $script:PwDirState.ActiveRc = $null
+    Export-PwDirContext
 }
 
 function Write-PwDirLog {
@@ -290,6 +370,9 @@ function Enable-PwDirEnv {
 
     # 先解析 exe：解析失败抛终止错误，此时尚未改动 prompt，无副作用
     $script:PwDirState.PwDirExe = Resolve-PwDirExe -PwDirPath $PwDirPath
+    # 子 pwsh 从父进程继承 PWDIRENV_CONTEXT。恢复它会使同 RC 的 native
+    # fingerprint fast path 保持 noop，而非因 ActiveRc=null 再强制 evaluator。
+    Import-PwDirContext
 
     # 保存用户原 prompt。注意：function: 查找沿模块作用域链进行，只能看到 global 作用域的
     # prompt —— 与「prompt 定义在 $PROFILE」的真实场景一致。若现有 prompt 已是本模块 wrapper
@@ -421,6 +504,7 @@ function Invoke-PwDirEnvHook {
             'apply' {
                 if ($rcChanged) { Write-PwDirLog info "loading $newRc" }
                 Apply-PwDirPatch $result
+                Export-PwDirContext
                 Write-PwDirExportSummary $result
             }
             'noop' {
@@ -429,6 +513,7 @@ function Invoke-PwDirEnvHook {
                     # noop 无 managed keys 可应用，但必须记录 ActiveRc —— 否则后续每次
                     # prompt 都判定 rc 变化并强制重评估，空 diff rc 的快速路径稳态无法形成
                     $script:PwDirState.ActiveRc = $newRc
+                    Export-PwDirContext
                 }
             }
             'error' {
