@@ -96,5 +96,4 @@ mod tests {
             PathBuf::from(r"C:\Users\alice\AppData\Local\PwDirEnv")
         );
     }
-
 }

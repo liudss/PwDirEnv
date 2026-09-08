@@ -409,7 +409,10 @@ mod tests {
         .expect("export returns protocol output");
 
         assert_eq!(out.action, Action::Blocked);
-        assert!(out.patch.is_empty(), "stale evaluator patch must not escape");
+        assert!(
+            out.patch.is_empty(),
+            "stale evaluator patch must not escape"
+        );
         assert!(out.fingerprint.is_none());
         assert!(cache.load(&rc).expect("cache load").is_none());
         std::env::remove_var("PWDIR_RACE_GUARD");

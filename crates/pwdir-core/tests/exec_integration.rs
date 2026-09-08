@@ -301,7 +301,10 @@ fn exec_does_not_spawn_command_when_rc_changes_during_evaluation() {
     .expect_err("changed RC must block exec");
 
     assert!(matches!(err, PwDirError::NotAllowed(_)));
-    assert!(!marker.exists(), "command must not spawn with a stale RC patch");
+    assert!(
+        !marker.exists(),
+        "command must not spawn with a stale RC patch"
+    );
 }
 
 #[test]
