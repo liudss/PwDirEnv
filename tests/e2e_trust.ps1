@@ -53,7 +53,7 @@ try {
     if (-not $status.rc_sha256 -or $status.rc_sha256.Length -ne 64) {
         throw "rc_sha256 missing or not 64 hex chars: $($status.rc_sha256)"
     }
-    if ($status.dirs.allow -ne (Join-Path $tempRoot 'allow')) {
+    if ($status.dirs.allow -ne (Join-Path $tempRoot 'PwDirEnv\allow')) {
         throw "dirs.allow not isolated: $($status.dirs.allow)"
     }
     Write-Output "  [2] status: allowed (rc=$($status.discovered_rc.rc_path), sha256=$($status.rc_sha256.Substring(0,12))...)"
