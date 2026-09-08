@@ -21,6 +21,16 @@ use pwdir_protocol::{EnvPatch, EnvironmentSnapshot};
 fn index_by_canonical(snapshot: &EnvironmentSnapshot) -> BTreeMap<String, (String, OsString)> {
     let mut index = BTreeMap::new();
     for (key, value) in &snapshot.vars {
+        // Windows 环境块里隐藏的「盘符当前目录」伪变量（`=C:=...` / `=D:=...`，Zed / VS Code
+        // 等按目录启动终端的启动器会注入）名称含 `=`，不是合法环境变量名。两侧 API 处理不对称：
+        // 基线用 Rust `std::env::vars_os()` 会捕获它们，desired 用 .NET
+        // `GetEnvironmentVariables('Process')` 却会过滤 —— 于是 diff 产出 `=D:` 这类伪 key，
+        // Host 应用时 `[Environment]::SetEnvironmentVariable` 抛
+        // "Environment variable name cannot contain equal character"。这里统一剔除，
+        // 保证 patch 的 key 永远是合法 Windows 变量名（SPEC §8.2 语义）。
+        if key.display.contains('=') {
+            continue;
+        }
         index.insert(key.canonical.clone(), (key.display.clone(), value.clone()));
     }
     index
@@ -197,5 +207,34 @@ mod tests {
         // baseline X=''、desired X='' → 无变化
         let patch = diff_env(&snap(&[("X", "")]), &snap(&[("X", "")]));
         assert!(patch.is_empty());
+    }
+
+    #[test]
+    fn hidden_drive_vars_with_equal_sign_are_ignored() {
+        // Windows 隐藏「盘符当前目录」伪变量（=C: / =D:）名称含 `=`：基线（Rust vars_os）
+        // 会捕获、desired（.NET GetEnvironmentVariables）会过滤。若不剔除，diff 会产出
+        // `=D:` 伪 key，Host 应用时 SetEnvironmentVariable 抛 "name cannot contain equal character"。
+        // 基线有 =D: + OLD，desired 两者皆无 → 只有 OLD 进 unset，=D: 被忽略
+        let baseline = snap(&[("=D:", "D:\\project\\hip_bench"), ("OLD", "1")]);
+        let desired = snap(&[]);
+
+        let patch = diff_env(&baseline, &desired);
+        assert!(patch.set.is_empty());
+        assert_eq!(
+            patch.unset.iter().collect::<Vec<_>>(),
+            vec!["OLD"],
+            "hidden =X: pseudo-vars must never surface in the patch"
+        );
+        assert!(
+            !patch.unset.iter().any(|k| k.contains('=')),
+            "patch unset must only contain valid env var names: {:?}",
+            patch.unset
+        );
+
+        // 反向：desired 有 =D:、baseline 无 → 也不得进入 set
+        let baseline = snap(&[("OLD", "1")]);
+        let desired = snap(&[("=D:", "x"), ("OLD", "1")]);
+        let patch = diff_env(&baseline, &desired);
+        assert!(patch.set.is_empty(), "set must not carry =X: keys");
     }
 }
