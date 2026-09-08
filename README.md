@@ -16,6 +16,8 @@ PwDirEnv/
 ├─ powershell/
 │  └─ PwDirEnv/                # Host Shell 侧 PowerShell module
 ├─ evaluator/                  # 隔离 evaluator（bootstrap + stdlib）
+├─ skills/
+│  └─ pwdirenv/SKILL.md        # Agent Skills 格式配套技能（供 AI agent 使用 pwdir）
 ├─ tests/
 │  ├─ integration/
 │  └─ fixtures/
@@ -257,6 +259,26 @@ pwsh -NoProfile -File packaging\install.ps1 -SkipBuild # 复用现有 target\rel
 拷贝到 InstallRoot 后打印后续步骤（① bin 加 PATH 或设 `PWDIRENV_EXE`；② Import-Module；
 ③ `pwdir hook install --yes`）—— **不自动修改系统/用户 PATH**（最小侵入）。
 winget manifest 占位见 `packaging/winget/`（正式发布流程不在仓库范围）。
+
+## Agent Skill（配套 AI 技能）
+
+`skills/pwdirenv/SKILL.md` 遵循 [Agent Skills](https://agentskills.io) 开放格式（SKILL.md + YAML
+frontmatter），向 AI 编码代理（Claude Code、Codex、opencode、Gemini CLI 等）提供使用 pwdir 的
+完整知识：trust/allow 安全模型、CLI 命令、`.envrc.ps1` 编写规则、stdlib 速查、排障表。
+`packaging\install.ps1` 会把它安装到 `<InstallRoot>\skills\pwdirenv\`。
+
+按所用 agent 复制到对应技能目录后重启 agent 即可被自动发现：
+
+```powershell
+$src = Join-Path $env:LOCALAPPDATA 'Programs\PwDirEnv\skills\pwdirenv'   # 默认安装位置
+# 仓库开发态可用：$src = '<repo>\skills\pwdirenv'
+Copy-Item -Recurse -Force $src (Join-Path $HOME '.claude\skills\')          # Claude Code
+Copy-Item -Recurse -Force $src (Join-Path $HOME '.agents\skills\')          # Codex / 通用
+Copy-Item -Recurse -Force $src (Join-Path $HOME '.config\opencode\skills\') # opencode
+```
+
+技能中的安全规则要求代理：执行 `pwdir allow` 前必须先向用户展示并说明 RC 内容（RC 是任意
+PowerShell 代码，不是沙箱）。
 
 ## MVP Definition of Done 核验（SPEC §26）
 
