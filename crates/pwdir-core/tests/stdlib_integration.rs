@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -8,6 +8,25 @@ use pwdir_core::evaluator::{evaluate, EvaluatorConfig};
 use pwdir_protocol::{DiscoveredRc, EvaluationResult, WatchDependency, RC_FILENAME};
 
 static PWSH_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+fn temp_project() -> tempfile::TempDir {
+    // Hosted Windows runners may expose TEMP through an 8.3 alias. PowerShell
+    // expands that alias, so construct fixtures with the long path on both sides.
+    // The helper contract tests lexical normalization, not filesystem identity.
+    let canonical = fs::canonicalize(std::env::temp_dir()).expect("resolve temp root");
+    #[cfg(windows)]
+    let root = {
+        let text = canonical.to_string_lossy();
+        if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            PathBuf::from(format!(r"\\{unc}"))
+        } else {
+            PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
+        }
+    };
+    #[cfg(not(windows))]
+    let root: PathBuf = canonical;
+    tempfile::tempdir_in(root).expect("temp project")
+}
 
 fn ensure_pwsh() {
     let ok = *PWSH_AVAILABLE.get_or_init(|| {
@@ -66,31 +85,10 @@ fn expect_ok(report: &pwdir_core::evaluator::EvaluationReport) -> EvaluationResu
         .expect("ok evaluation must carry a result")
 }
 
-struct PathGuard {
-    original: Option<std::ffi::OsString>,
-}
-
-impl PathGuard {
-    fn set(value: String) -> Self {
-        let original = std::env::var_os("PATH");
-        std::env::set_var("PATH", value);
-        Self { original }
-    }
-}
-
-impl Drop for PathGuard {
-    fn drop(&mut self) {
-        match &self.original {
-            Some(value) => std::env::set_var("PATH", value),
-            None => std::env::remove_var("PATH"),
-        }
-    }
-}
-
 #[test]
 fn path_add_prepends_project_root_relative_path() {
     ensure_pwsh();
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = temp_project();
     let rc = write_rc(tmp.path(), "PATH_add '.\\bin'");
 
     let report = evaluate(&config(15), &rc).expect("evaluate ok");
@@ -106,22 +104,23 @@ fn path_add_prepends_project_root_relative_path() {
 #[test]
 fn path_add_dedupes_equivalent_entry_and_moves_it_to_front() {
     ensure_pwsh();
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = temp_project();
     let root = tmp.path().to_string_lossy().replace('\\', "/");
     let equivalent = format!("{root}/BIN/");
-    let original = std::env::var_os("PATH").unwrap_or_default();
-    let _guard = PathGuard::set(format!(
-        "zzz-pwdirenv-before;{equivalent};zzz-pwdirenv-after;{}",
-        original.to_string_lossy()
-    ));
-
-    let rc = write_rc(tmp.path(), "PATH_add '.\\bin'");
+    // Set PATH inside this evaluator, not in the concurrently shared test process.
+    let equivalent = equivalent.replace('\'', "''");
+    let rc = write_rc(
+        tmp.path(),
+        &format!(
+            "$env:PATH = 'zzz-pwdirenv-before;{equivalent};zzz-pwdirenv-after;' + $env:PATH\nPATH_add '.\\bin'"
+        ),
+    );
     let report = evaluate(&config(15), &rc).expect("evaluate ok");
     let result = expect_ok(&report);
     let path = env_of(&result, "PATH").expect("PATH present");
 
     let items: Vec<&str> = path.split(';').collect();
-    let normalize = |s: &str| s.replace('\\', "/").to_lowercase();
+    let normalize = |s: &str| s.replace('\\', "/").trim_end_matches('/').to_lowercase();
     let expected = tmp.path().join("bin").to_string_lossy().to_string();
     let expected_norm = normalize(&expected);
     let count = items
@@ -154,7 +153,7 @@ fn path_add_dedupes_equivalent_entry_and_moves_it_to_front() {
 #[test]
 fn path_add_allows_nonexistent_directory() {
     ensure_pwsh();
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = temp_project();
     let rc = write_rc(tmp.path(), "PATH_add '.\\does-not-exist-at-eval-time'");
 
     let report = evaluate(&config(15), &rc).expect("evaluate ok");
@@ -173,7 +172,7 @@ fn path_add_allows_nonexistent_directory() {
 #[test]
 fn dotenv_parses_fixture_and_does_not_override_existing() {
     ensure_pwsh();
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = temp_project();
     let lines = [
         "\u{FEFF}# PwDirEnv dotenv fixture",
         "",
@@ -221,7 +220,7 @@ fn dotenv_parses_fixture_and_does_not_override_existing() {
 #[test]
 fn dotenv_overload_switch_forces_override() {
     ensure_pwsh();
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = temp_project();
     fs::write(
         tmp.path().join(".env"),
         "PWDIRENV_DOTENV_OVERLOAD=after\r\n",
@@ -243,7 +242,7 @@ fn dotenv_overload_switch_forces_override() {
 #[test]
 fn dotenv_missing_file_fails_evaluation() {
     ensure_pwsh();
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = temp_project();
     let rc = write_rc(tmp.path(), "dotenv '.env.definitely-missing'");
 
     let report = evaluate(&config(15), &rc).expect("evaluate returns report");
@@ -265,7 +264,7 @@ fn dotenv_missing_file_fails_evaluation() {
 #[test]
 fn dotenv_if_exists_existing_parses_and_missing_is_silent_noop() {
     ensure_pwsh();
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = temp_project();
     fs::write(tmp.path().join(".env.local"), "FROM_LOCAL=yes\r\n").expect("write .env.local");
 
     let rc = write_rc(
@@ -281,7 +280,7 @@ fn dotenv_if_exists_existing_parses_and_missing_is_silent_noop() {
 #[test]
 fn watch_file_and_watch_dir_resolve_against_project_root() {
     ensure_pwsh();
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = temp_project();
     let rc = write_rc(
         tmp.path(),
         "watch_file 'package.json'\nwatch_file 'package.json' '..\\shared\\x.ps1'\nwatch_dir '.\\config'\nwatch_dir '.\\config'",
@@ -301,7 +300,7 @@ fn watch_file_and_watch_dir_resolve_against_project_root() {
 #[test]
 fn source_env_runs_in_scope_and_records_metadata() {
     ensure_pwsh();
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = temp_project();
     fs::write(tmp.path().join("common.ps1"), "$env:FROM_SOURCE = 'yes'")
         .expect("write common.ps1 fixture");
     let rc = write_rc(tmp.path(), "source_env '.\\common.ps1'");
@@ -317,7 +316,7 @@ fn source_env_runs_in_scope_and_records_metadata() {
 #[test]
 fn source_up_loads_nearest_parent_rc() {
     ensure_pwsh();
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = temp_project();
     fs::write(tmp.path().join(RC_FILENAME), "$env:FROM_PARENT = 'up'")
         .expect("write parent rc fixture");
     let project = tmp.path().join("proj");
@@ -335,7 +334,7 @@ fn source_up_loads_nearest_parent_rc() {
 #[test]
 fn source_up_without_parent_rc_is_noop() {
     ensure_pwsh();
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = temp_project();
     let project = tmp.path().join("proj");
     fs::create_dir(&project).expect("mkdir proj");
     let rc = write_rc(&project, "source_up\n$env:PWDIRENV_MARKER = 'ok'");

@@ -12,7 +12,7 @@ not a development schedule.
 | Reload | Same-RC evaluation inherits applied values. Deleted assignments can remain until unload. Leave/reenter for a clean evaluation. |
 | Dependencies | Size/mtime can miss edits preserving both. Directory watches are not recursive. Evaluation does not snapshot dependencies. |
 | Authorization | Top-level RC only; sourced scripts are not separately authorized. Pre/post checks do not eliminate all replacement races. |
-| Path identity | Lexical normalization; no Windows file-ID hardening or general path-alias unification. |
+| Path identity | Lexical normalization; no Windows file-ID hardening or general path-alias unification. Mixing 8.3 short aliases and long paths can prevent PATH deduplication. |
 | Nested shells | `PWDIRENV_CONTEXT` includes restoration values, potentially secrets, and increases environment size. |
 | Empty values | Protocol distinguishes empty/absent; runtime behavior across older supported PowerShell/.NET versions needs validation. |
 | Exec | Direct argument passing; stdout/stderr buffered until exit. Interactive terminal applications are not validated. |
