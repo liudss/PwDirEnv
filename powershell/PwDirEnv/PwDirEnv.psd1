@@ -19,9 +19,9 @@
     PrivateData = @{
         PSData = @{
             Tags = @('PwDirEnv', 'direnv', 'environment', 'env', 'Windows', 'PowerShell', 'dotenv')
-            LicenseUri = 'https://example.invalid/PwDirEnv/LICENSE'
-            ProjectUri = 'https://example.invalid/PwDirEnv'
-            ReleaseNotes = 'M0 scaffold: module skeleton with status introspection.'
+            LicenseUri = 'https://github.com/liudss/PwDirEnv/blob/main/LICENSE'
+            ProjectUri = 'https://github.com/liudss/PwDirEnv'
+            ReleaseNotes = 'Early preview: directory environments, content approval, restoration, helpers, and diagnostics. See docs/limitations.md.'
         }
     }
 }

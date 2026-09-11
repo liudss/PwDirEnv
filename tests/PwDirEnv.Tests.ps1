@@ -1,8 +1,7 @@
 #requires -Version 7.2
-# PwDirEnv PowerShell module 单元测试（Pester 5 语法，SPEC §24.2）。
-#
-# 兼容性守卫：本机 Pester < 5（如 Windows 内置 3.4.0）时直接跳过，不会跑挂 ——
-# tests/e2e_hook.ps1 才是必跑的真实验收（SPEC §24.6 release blocker）。
+
+# Optional Pester 5 coverage; standalone E2E scripts do not require Pester.
+
 $pesterModule = Get-Module -ListAvailable Pester |
     Sort-Object -Property Version -Descending |
     Select-Object -First 1
@@ -18,12 +17,12 @@ if (-not (Test-Path -LiteralPath $pwdirExeForGuard)) {
     return
 }
 
-Describe 'PwDirEnv module (M4)' {
+Describe 'PwDirEnv module' {
     BeforeAll {
         $script:RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).ProviderPath
         $script:PwDirExePath = Join-Path $script:RepoRoot 'target\debug\pwdir.exe'
         Import-Module (Join-Path $script:RepoRoot 'powershell\PwDirEnv\PwDirEnv.psd1') -Force
-        # prompt 定义在 global 作用域（与 $PROFILE 场景一致），模块才能保存/恢复它
+
         function global:prompt { 'pester-prompt> ' }
     }
 
@@ -33,21 +32,21 @@ Describe 'PwDirEnv module (M4)' {
     }
 
     AfterEach {
-        # 清理：恢复环境状态与测试用环境变量
+
         InModuleScope PwDirEnv { Restore-PwDirEnvironment }
         Remove-Item -Path 'Env:PWDIR_PESTER_*' -ErrorAction Ignore
     }
 
-    Context 'Enable / Disable 生命周期' {
-        It 'Enable 保留用户原 prompt 且幂等' {
+    Context 'Enable / Disable lifecycle' {
+        It 'Enable preserves the original prompt and is idempotent' {
             Enable-PwDirEnv -PwDirPath $script:PwDirExePath
             (prompt) | Should -Be 'pester-prompt> '
-            Enable-PwDirEnv   # 幂等：第二次调用不抛错、状态不变
+            Enable-PwDirEnv
             (Get-PwDirEnvStatus).Enabled | Should -BeTrue
             (prompt) | Should -Be 'pester-prompt> '
         }
 
-        It 'Disable 恢复原 prompt、清空环境状态且幂等' {
+        It 'Disable restores the prompt, clears state, and is idempotent' {
             Enable-PwDirEnv -PwDirPath $script:PwDirExePath
             Disable-PwDirEnv
             (prompt) | Should -Be 'pester-prompt> '
@@ -55,23 +54,23 @@ Describe 'PwDirEnv module (M4)' {
             $status.Enabled | Should -BeFalse
             $status.ActiveRc | Should -BeNullOrEmpty
             $status.BaselineCount | Should -Be 0
-            Disable-PwDirEnv   # 幂等
+            Disable-PwDirEnv
         }
     }
 
-    Context 'reentrancy guard（SPEC §13.3）' {
-        It 'HookRunning=true 时 hook 立即返回，不进入 cwd 检查' {
+    Context 'reentrancy guard' {
+        It 'HookRunning causes an immediate return before checking cwd' {
             Enable-PwDirEnv -PwDirPath $script:PwDirExePath
             Mock Get-PwDirCurrentFileSystemPath { return $null } -ModuleName PwDirEnv -Verifiable
             InModuleScope PwDirEnv {
                 $script:PwDirState.HookRunning = $true
-                Invoke-PwDirEnvHook   # guard 生效：立即 return，mock 不应被调用
+                Invoke-PwDirEnvHook
                 $script:PwDirState.HookRunning = $false
             }
             Should -Invoke Get-PwDirCurrentFileSystemPath -ModuleName PwDirEnv -Exactly -Times 0
         }
 
-        It 'guard 复位后 hook 正常执行 cwd 检查' {
+        It 'a cleared guard permits cwd checks' {
             Enable-PwDirEnv -PwDirPath $script:PwDirExePath
             Mock Get-PwDirCurrentFileSystemPath { return $null } -ModuleName PwDirEnv -Verifiable
             Invoke-PwDirEnvHook
@@ -80,7 +79,7 @@ Describe 'PwDirEnv module (M4)' {
     }
 
     Context 'Get-PwDirCurrentFileSystemPath' {
-        It 'FileSystem provider 下返回 ProviderPath' {
+        It 'returns ProviderPath for the FileSystem provider' {
             Push-Location $TestDrive
             try {
                 InModuleScope PwDirEnv {
@@ -90,7 +89,7 @@ Describe 'PwDirEnv module (M4)' {
             finally { Pop-Location }
         }
 
-        It '非 FileSystem provider（注册表）返回 $null' {
+        It 'returns null for the registry provider' {
             Push-Location HKLM:\
             try {
                 InModuleScope PwDirEnv { Get-PwDirCurrentFileSystemPath } | Should -BeNullOrEmpty
@@ -99,8 +98,8 @@ Describe 'PwDirEnv module (M4)' {
         }
     }
 
-    Context 'Apply / Restore baseline（SPEC §8.4）' {
-        It 'Apply-PwDirPatch 记录 baseline 并应用 set/unset' {
+    Context 'Apply / Restore baseline' {
+        It 'captures baseline and applies set and unset' {
             $env:PWDIR_PESTER_EXISTING = 'orig'
             InModuleScope PwDirEnv {
                 $result = [pscustomobject]@{
@@ -114,14 +113,14 @@ Describe 'PwDirEnv module (M4)' {
                 (Get-PwDirEnvStatus).ActiveRc | Should -Be 'C:\fake\.envrc.ps1'
                 (Get-PwDirEnvStatus).BaselineCount | Should -Be 2
             }
-            $env:PWDIR_PESTER_EXISTING | Should -BeNullOrEmpty   # unset 生效
+            $env:PWDIR_PESTER_EXISTING | Should -BeNullOrEmpty
             $env:PWDIR_PESTER_NEW | Should -Be 'added'
             InModuleScope PwDirEnv { Restore-PwDirEnvironment }
-            $env:PWDIR_PESTER_EXISTING | Should -Be 'orig'       # baseline 恢复原值
-            $env:PWDIR_PESTER_NEW | Should -BeNullOrEmpty        # 新增 key 恢复为不存在
+            $env:PWDIR_PESTER_EXISTING | Should -Be 'orig'
+            $env:PWDIR_PESTER_NEW | Should -BeNullOrEmpty
         }
 
-        It 'restore 对原本不存在的 key 恢复为不存在（Existed/Value 语义）' {
+        It 'restore removes keys that were originally absent' {
             InModuleScope PwDirEnv {
                 $result = [pscustomobject]@{
                     rc    = 'C:\fake\.envrc.ps1'
@@ -140,7 +139,7 @@ Describe 'PwDirEnv module (M4)' {
             $env:PWDIR_PESTER_FRESH | Should -BeNullOrEmpty
         }
 
-        It '同 key 大小写不同的引用只记录一份 baseline（Windows 大小写不敏感）' {
+        It 'different casing records a single baseline entry' {
             InModuleScope PwDirEnv {
                 $first = [pscustomobject]@{
                     rc    = 'C:\fake\.envrc.ps1'
@@ -164,25 +163,25 @@ Describe 'PwDirEnv module (M4)' {
         }
     }
 
-    Context '错误语义（SPEC §13.4）' {
-        It 'pwdir.exe 缺失时 hook 不抛错、prompt 仍可用' {
+    Context 'error handling' {
+        It 'a missing executable does not break the prompt' {
             Enable-PwDirEnv -PwDirPath $script:PwDirExePath
             InModuleScope PwDirEnv {
                 $script:PwDirState.PwDirExe = 'Z:\__definitely_missing__\pwdir.exe'
                 { Invoke-PwDirEnvHook } | Should -Not -Throw
             }
-            (prompt) | Should -Be 'pester-prompt> '   # 错误不破坏 prompt
+            (prompt) | Should -Be 'pester-prompt> '
         }
     }
 
-    Context 'Get-PwDirEnvStatus 契约' {
-        It '返回 M4 状态字段' {
+    Context 'Get-PwDirEnvStatus contract' {
+        It 'returns session state fields' {
             $status = Get-PwDirEnvStatus
             $status.Version | Should -Not -BeNullOrEmpty
             foreach ($field in 'Enabled', 'PwDirExe', 'ActiveRc', 'ManagedKeys', 'HookRunning', 'BaselineCount', 'Fingerprint') {
                 $status.PSObject.Properties.Name | Should -Contain $field
             }
-            $status.Fingerprint | Should -BeNullOrEmpty   # M4 恒为 $null（M6 启用）
+            $status.Fingerprint | Should -BeNullOrEmpty
         }
     }
 }

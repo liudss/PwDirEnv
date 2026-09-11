@@ -1,8 +1,3 @@
-//! exec 集成测试（M7，SPEC §14.5）：真实 pwsh 子进程验证 argv-safe 执行、
-//! RC 环境注入、exit code 传播与 trust 边界。
-//!
-//! trust store 注入临时目录（与 export/cache 测试同模式），不触碰真实 LOCALAPPDATA。
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,7 +9,6 @@ use pwdir_core::trust::TrustStore;
 use pwdir_core::PwDirError;
 use pwdir_protocol::RC_FILENAME;
 
-/// pwsh 可用性只探测一次（spawn pwsh 成本高）。
 static PWSH_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 fn ensure_pwsh() {
@@ -33,14 +27,12 @@ fn ensure_pwsh() {
     );
 }
 
-/// 注入临时 allow 目录的 trust store；返回 TempDir guard 以维持目录生命周期。
 fn temp_store() -> (TrustStore, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = TrustStore::new(tmp.path().join("allow"));
     (store, tmp)
 }
 
-/// 在 dir 下写入 `.envrc.ps1` 并返回 rc 路径。
 fn write_rc(dir: &Path, body: &str) -> PathBuf {
     let rc = dir.join(RC_FILENAME);
     fs::write(&rc, body).expect("write rc fixture");
@@ -112,7 +104,6 @@ fn exec_works_in_dir_with_spaces() {
     let (store, _guard) = temp_store();
     store.allow(&rc).expect("allow rc");
 
-    // pwd 展示 + rc 环境注入都发生在含空格路径下
     let outcome = run_exec_with_store(
         &spaced,
         "pwsh",
@@ -163,7 +154,6 @@ fn exec_without_rc_runs_with_inherited_environment() {
 #[test]
 fn exec_unsets_variables_removed_by_rc() {
     ensure_pwsh();
-    // baseline 中预先存在变量，RC 删除它 → 子进程必须看不到（env_remove 路径）
     std::env::set_var("PWDIR_EXEC_REMOVE_ME", "gone-soon");
     let tmp = tempfile::tempdir().expect("tempdir");
     let rc = write_rc(
@@ -221,9 +211,7 @@ fn exec_blocked_rc_is_not_allowed_and_command_never_runs() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let _rc = write_rc(tmp.path(), "$env:PW_EXEC_BLOCKED = '1'");
     let (store, _guard) = temp_store();
-    // 故意不 allow
 
-    // 子命令会写 marker 文件；NotAllowed 分支必须在 spawn 之前返回
     let marker = tmp.path().join("child-ran.marker");
     let err = run_exec_with_store(
         tmp.path(),

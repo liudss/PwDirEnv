@@ -1,7 +1,4 @@
-//! pwdir-protocol：PwDirEnv native core 与 Host Shell 之间的纯数据协议（schema 1）。
-//!
-//! 本 crate 只定义 serde 数据结构，无 IO、无平台逻辑（见 SPEC §16）。
-//! 字段名保持 snake_case，与 `pwdir export --format json` 的 JSON 契约一致。
+//! Schema-1 data structures for native/PowerShell communication. JSON uses Unicode strings; native OS values may require lossy conversion.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -12,27 +9,19 @@ use chrono::{DateTime, Utc};
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize};
 
-/// 协议 schema 版本。结构变更必须提升此值。
 pub const PROTOCOL_SCHEMA: u32 = 1;
 
-/// 唯一默认 RC 文件名（SPEC §5.1）。
-///
-/// 首版不识别 Bash 语义的 `.envrc`，避免把 Bash 脚本交给 PowerShell evaluator。
 pub const RC_FILENAME: &str = ".envrc.ps1";
 
-/// 向上发现的结果：RC 文件与其所属 project root（即 RC 所在目录，SPEC §5.2/§16）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveredRc {
     pub project_root: PathBuf,
     pub rc_path: PathBuf,
 }
 
-/// Windows 环境变量名（大小写不敏感语义，SPEC §8.2）。
-///
-/// `canonical` 为 ASCII invariant uppercase，用于归并与比较；
-/// `display` 保留原始大小写，序列化时作为 JSON map key 输出。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(into = "String", from = "String")]
+/// Retain display casing; diff code indexes by canonical ASCII-uppercase names.
 pub struct EnvKey {
     pub canonical: String,
     pub display: String,
@@ -40,8 +29,6 @@ pub struct EnvKey {
 
 impl EnvKey {
     pub fn from_name(name: &str) -> Self {
-        // 只对 ASCII 做 invariant uppercase；非 ASCII 字符保持原样，
-        // 避免 Unicode 大小写折叠引入跨平台的歧义映射。
         let canonical: String = name.chars().map(|c| c.to_ascii_uppercase()).collect();
         Self {
             canonical,
@@ -68,7 +55,6 @@ impl From<EnvKey> for String {
     }
 }
 
-/// 环境变量 diff：`set` 同时覆盖新增和修改，`unset` 为待删除的变量名（SPEC §8.3）。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EnvPatch {
     pub set: BTreeMap<String, String>,
@@ -81,7 +67,6 @@ impl EnvPatch {
     }
 }
 
-/// Trust record：基于 RC 内容 SHA-256 的授权记录（SPEC §6.2，ADR-005）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustRecord {
     pub schema: u32,
@@ -91,35 +76,26 @@ pub struct TrustRecord {
     pub allowed_at: DateTime<Utc>,
 }
 
-/// 一份完整的 Process 环境快照（SPEC §8.1/§16）。
-///
-/// JSON 线上格式为 `{ "<name>": "<value>", ... }`（变量名用 display casing，
-/// 值为普通 Unicode 字符串）。不直接 derive serde：std `OsString` 在 Windows
-/// 上会序列化成 `{"Windows": [bytes]}` 的 WTF-8 enum 形态，且拒绝从普通
-/// JSON 字符串反序列化 —— 与 bootstrap 结果文件契约（vars 值是字符串）冲突，
-/// 因此手动实现 Serialize/Deserialize（SPEC §16.1：JSON 必须输出 Unicode string）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Custom JSON representation avoids platform-specific OsString serialization.
 pub struct EnvironmentSnapshot {
     pub vars: BTreeMap<EnvKey, OsString>,
 }
 
 impl Serialize for EnvironmentSnapshot {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // 线上结构 = struct 形态 {"vars": { "<name>": "<value>" }}，与 bootstrap 结果文件契约一致
         let mut state = serializer.serialize_struct("EnvironmentSnapshot", 1)?;
         state.serialize_field("vars", &VarsView(&self.vars))?;
         state.end()
     }
 }
 
-/// `vars` map 的视图序列化器：key 用 display casing，value 用普通 Unicode 字符串。
 struct VarsView<'a>(&'a BTreeMap<EnvKey, OsString>);
 
 impl Serialize for VarsView<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(self.0.len()))?;
         for (key, value) in self.0 {
-            // JSON 无法表示非法 Unicode；env value 按 lossy 转换（SPEC §16.1 认可的边界）
             map.serialize_entry(&key.display, value.to_string_lossy().as_ref())?;
         }
         map.end()
@@ -149,7 +125,6 @@ impl<'de> Deserialize<'de> for EnvironmentSnapshot {
                             vars.insert(EnvKey::from_name(&name), OsString::from(value));
                         }
                     } else {
-                        // 未知字段（如未来 schema 扩展）跳过
                         access.next_value::<serde::de::IgnoredAny>()?;
                     }
                 }
@@ -162,14 +137,6 @@ impl<'de> Deserialize<'de> for EnvironmentSnapshot {
 }
 
 impl EnvironmentSnapshot {
-    /// 从**当前进程**的 Process environment 构造快照（SPEC §8.1）。
-    ///
-    /// pwdir.exe 是 Host pwsh 的直接子进程，其继承环境即 Host 当前环境，
-    /// 因此 M3 的 baseline diff 直接以本方法的结果为起点（SPEC §7.3）。
-    ///
-    /// 变量名经 `EnvKey::from_name` 归一 canonical 大小写；重复 key
-    /// （仅大小写不同）按 `vars_os` 枚举顺序**后者胜出**，与 Windows
-    /// 环境块"同名覆盖"语义一致。
     pub fn from_process() -> Self {
         let mut vars: BTreeMap<EnvKey, OsString> = BTreeMap::new();
         for (name, value) in std::env::vars_os() {
@@ -178,7 +145,6 @@ impl EnvironmentSnapshot {
         Self { vars }
     }
 
-    /// 按 canonical 名称（大小写不敏感）查询变量值。
     pub fn get_canonical(&self, name: &str) -> Option<&OsString> {
         let canonical = EnvKey::from_name(name).canonical;
         self.vars
@@ -188,8 +154,6 @@ impl EnvironmentSnapshot {
     }
 }
 
-/// 一次成功 evaluation 的完整结果（SPEC §16）：resulting environment +
-/// watch/source 元数据 + 结构化 diagnostics。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EvaluationResult {
     pub environment: EnvironmentSnapshot,
@@ -198,19 +162,15 @@ pub struct EvaluationResult {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// evaluator 失败时的结构化错误（bootstrap catch 分支产物，SPEC §17）。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EvaluationError {
-    /// 错误类别，如 `evaluation-failed` / `timeout` / `no-result` / `protocol-invalid`。
     pub kind: String,
     pub message: String,
-    /// 异常类型全名（如 `System.Management.Automation.RuntimeException`）。
     pub exception: Option<String>,
     /// PowerShell script stack trace.
     pub stack: Option<String>,
 }
 
-/// Watch 依赖（SPEC §12.2）。JSON 形如 `{"kind": "file", "path": "..."}`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "path")]
 pub enum WatchDependency {
@@ -220,7 +180,6 @@ pub enum WatchDependency {
     Directory(PathBuf),
 }
 
-/// 单个文件的快速 fingerprint（size + mtime；SHA-256 仅在快速路径判变后计算）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileFingerprint {
     pub path: PathBuf,
@@ -228,24 +187,17 @@ pub struct FileFingerprint {
     pub modified: Option<SystemTime>,
 }
 
-/// 一次 evaluation 的指纹，用于 hook 快速路径判变（SPEC §12.2）。
-/// `rc_sha256` 用 hex 字符串表示，便于 JSON 与 trust record 互操作。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fingerprint {
     pub rc_sha256: String,
     pub sourced_files: Vec<FileFingerprint>,
     pub watches: Vec<WatchDependency>,
-    /// watched 文件/目录在 evaluate 时点的 size+mtime 快照（M6，与 `watches` 按下标对齐）。
-    /// 快速路径据此做廉价判变，不必重新 evaluate；`#[serde(default)]` 保证旧 JSON 兼容。
-    /// watch 目标允许尚不存在（stdlib 语义），不存在时以 size=0 + modified=None 的
-    /// 「缺失哨兵」占位，使「评估时不存在、检查时仍不存在」稳定判为未变。
     #[serde(default)]
     pub watch_states: Vec<FileFingerprint>,
     pub evaluator_version: String,
     pub stdlib_version: String,
 }
 
-/// export 动作语义（SPEC §14.7）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
@@ -256,14 +208,12 @@ pub enum Action {
     Error,
 }
 
-/// 结构化诊断信息。level 取 error/warn/info/debug。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub level: String,
     pub message: String,
 }
 
-/// `pwdir export --format json` 的顶层输出（SPEC §14.7）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportOutput {
     pub schema: u32,
@@ -290,7 +240,6 @@ mod tests {
         assert_eq!(mixed.canonical, lower.canonical);
         assert_eq!(upper.canonical, "PATH");
 
-        // display 保留原始大小写
         assert_eq!(upper.display, "PATH");
         assert_eq!(mixed.display, "Path");
         assert_eq!(lower.display, "path");
@@ -298,7 +247,6 @@ mod tests {
 
     #[test]
     fn env_key_ord_groups_by_canonical() {
-        // BTreeMap<EnvKey, _> 按 canonical 优先排序，同类 key 聚在一起
         let mut map = BTreeMap::new();
         map.insert(EnvKey::from_name("Path"), OsString::from("a"));
         map.insert(EnvKey::from_name("APPDATA"), OsString::from("b"));
@@ -349,7 +297,6 @@ mod tests {
 
     #[test]
     fn export_output_round_trips_spec_json() {
-        // 对齐 SPEC §14.7 的示例 JSON 结构
         let output = ExportOutput {
             schema: PROTOCOL_SCHEMA,
             action: Action::Apply,
@@ -391,7 +338,6 @@ mod tests {
             .get_canonical("PATH")
             .expect("process env always has PATH");
         assert!(!path.is_empty(), "PATH value should not be empty");
-        // display casing 保留原始形态（Windows 上通常是 `Path`）
         let key = snapshot
             .vars
             .keys()
@@ -406,7 +352,6 @@ mod tests {
         let raw = serde_json::to_string(&snapshot).expect("serialize snapshot");
         let back: EnvironmentSnapshot = serde_json::from_str(&raw).expect("deserialize snapshot");
         assert_eq!(back, snapshot);
-        // canonical 归并：反序列化后 PATH 仍可按 canonical 查询
         assert!(back.get_canonical("pAtH").is_some());
     }
 
@@ -434,7 +379,6 @@ mod tests {
         };
 
         let value = serde_json::to_value(&result).unwrap();
-        // watches 的 kind 标签必须出现在 JSON 中（file / dir）
         assert_eq!(
             value["watches"][0],
             json!({"kind": "file", "path": r"C:\src\app\package.json"})
@@ -451,7 +395,6 @@ mod tests {
             value["diagnostics"][0],
             json!({"level": "info", "message": "loaded"})
         );
-        // environment.vars 的 value 是字符串形态
         assert_eq!(value["environment"]["vars"]["FOO"], json!("bar"));
 
         let back: EvaluationResult = serde_json::from_value(value).unwrap();
@@ -514,8 +457,6 @@ mod tests {
 
     #[test]
     fn fingerprint_deserializes_legacy_json_without_watch_states() {
-        // M6 前的 JSON 没有 watch_states：#[serde(default)] 兜底为空 Vec，
-        // 旧 cache/协议载荷反序列化不报错（由 core 侧把空 watch_states 视为「已变化」）
         let legacy = json!({
             "rc_sha256": "abc",
             "sourced_files": [],

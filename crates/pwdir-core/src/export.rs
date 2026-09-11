@@ -1,24 +1,4 @@
-//! export 编排（M3 + M6，SPEC §14.7/§12.5）：`pwdir export --format json` 的核心协议入口。
-//!
-//! 流程（严格顺序）：
-//! 1. 延迟到完整评估前捕获 baseline；无 RC、blocked 和缓存命中无需复制环境。
-//!    pwdir.exe 继承的环境与 evaluator 一致（SPEC §8.1/§7.3）；
-//! 2. 向上发现 RC：无 RC → `Noop`（module 自己判断要不要 unload 旧环境）；
-//! 3. 有 RC → trust 校验：未授权 → `Blocked`（patch 恒为空，RC 内容绝不执行）；
-//! 4. 已授权 → **fingerprint 快速路径（M6）**：未传 force 且磁盘 cache 的指纹仍与当前
-//!    现实一致 → 直接返回 `Noop`（不 spawn evaluator，patch 恒为空）—— 这是每 prompt
-//!    的稳态，P95 目标 < 20ms（SPEC §22）；
-//! 5. 快速路径未命中（首次评估 / RC 或 watch/sourced 变化 / 版本变化 / force）→
-//!    evaluator 隔离评估：
-//!    - 成功 → 计算 fingerprint、原子写入 cache、`patch = diff_env(baseline, desired)`，
-//!      非空则 `Apply` 否则 `Noop`；
-//!    - RC 失败/超时 → `Error`（协议语义，不写 cache —— last-known-good 不被坏结果污染）；
-//!    - 基础设施故障（pwsh 缺失等）→ `Err` 向上传播，由 CLI 按退出码映射。
-//!
-//! `force` 语义：跳过快速路径强制评估。Host module 在「rc 与 ActiveRc 不一致」
-//! （新 shell 首次进入 / 切换目录）时必须传 force —— cache 是跨会话共享的，
-//! 上一个会话留下的有效 cache 会令快速路径返回空 patch，而新 shell 的进程环境
-//! 尚未加载该项目环境，不 force 会漏掉加载。
+//! Discover, authorize, check cache, and export a structured environment patch. Cache hits require host session state; fresh sessions may need force.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -34,14 +14,13 @@ use crate::fingerprint::{compute_fingerprint, fingerprint_is_current};
 use crate::trust::TrustStore;
 use crate::PwDirError;
 
-/// 用默认 trust store 与 cache store 执行一次 export。
 pub fn export(cwd: &Path, cfg: &EvaluatorConfig, force: bool) -> Result<ExportOutput, PwDirError> {
     let store = TrustStore::open()?;
     let cache = CacheStore::open()?;
     export_with_store(cwd, cfg, &store, &cache, force)
 }
 
-/// 用注入的 trust / cache store 执行一次 export（测试可注入临时目录）。
+/// Export using injectable stores. Force bypasses shared cache, never authorization.
 pub fn export_with_store(
     cwd: &Path,
     cfg: &EvaluatorConfig,
@@ -49,7 +28,6 @@ pub fn export_with_store(
     cache: &CacheStore,
     force: bool,
 ) -> Result<ExportOutput, PwDirError> {
-    // cwd 不可用（目录被删除，CLI 传空路径）时不 panic：按无 RC 处理并给 diagnostic（SPEC §20.4）
     if cwd.as_os_str().is_empty() {
         return Ok(ExportOutput {
             schema: PROTOCOL_SCHEMA,
@@ -65,7 +43,6 @@ pub fn export_with_store(
         });
     }
 
-    // 2. 发现 RC：None → Noop（module 侧决定是否 unload 旧环境）
     let Some(rc) = discovery::find_rc(cwd)? else {
         return Ok(ExportOutput {
             schema: PROTOCOL_SCHEMA,
@@ -78,13 +55,10 @@ pub fn export_with_store(
         });
     };
 
-    // 3. trust 校验：blocked 时 patch 恒为空 —— RC 内容一行都不执行（安全边界 > 一切）
     if !store.is_allowed(&rc.rc_path)? {
         return Ok(blocked_output(&rc.rc_path));
     }
 
-    // 4. fingerprint 快速路径（M6）：trust 已通过，cache 指纹仍与现实一致 → noop 不 spawn。
-    //    cache load / 判变的任何「未命中」都自然落入下方完整评估，安全降级。
     if !force {
         if let Some(entry) = cache.load(&rc.rc_path)? {
             if fingerprint_is_current(&entry.fingerprint, &rc.rc_path) {
@@ -104,21 +78,16 @@ pub fn export_with_store(
         }
     }
 
-    // 5. 隔离评估。Err（基础设施故障）直接向上传播，CLI 按退出码映射处理
-    // 只有完整评估需要 baseline，避免每次 prompt 的快速路径枚举、分配全部环境变量。
+    // Cache hits, blocked RCs, and absent RCs do not need an environment snapshot.
     let baseline = EnvironmentSnapshot::from_process();
     let versions = evaluator::embedded_script_versions();
     let report = evaluator::evaluate(cfg, &rc)?;
 
-    // evaluator 运行期间 RC 可能被编辑或替换。此时 evaluation result 对应的是
-    // 旧内容，绝不能以新内容的 fingerprint 写入 cache，更不能把旧 patch 应用到 Host。
-    // 重新验证授权会同时校验当前 bytes 是否仍是 allow 时的内容。
     if !store.is_allowed(&rc.rc_path)? {
         return Ok(blocked_output(&rc.rc_path));
     }
 
     match (report.result, report.error) {
-        // 成功 → 计算 fingerprint、写 cache（原子替换）、diff 出 patch
         (Some(result), _) => {
             let fingerprint = compute_fingerprint(&rc.rc_path, &result, &versions.0, &versions.1);
             cache.save(&CacheEntry {
@@ -130,7 +99,6 @@ pub fn export_with_store(
 
             let desired = result.environment;
             let patch = diff_env(&baseline, &desired);
-            // managed_keys = set.keys ∪ unset，排序去重 —— PwDirEnv "owns" 的 key 集合（SPEC §8.5）
             let mut managed: BTreeSet<String> = patch.set.keys().cloned().collect();
             managed.extend(patch.unset.iter().cloned());
             let action = if patch.is_empty() {
@@ -148,8 +116,6 @@ pub fn export_with_store(
                 diagnostics: vec![],
             })
         }
-        // RC 失败/超时：结构化协议语义（action=error），patch 恒为空；
-        // 不写 cache —— 失败结果不能成为后续快速路径的依据（last-known-good，SPEC §20.2）
         (None, Some(error)) => Ok(ExportOutput {
             schema: PROTOCOL_SCHEMA,
             action: Action::Error,
@@ -162,7 +128,6 @@ pub fn export_with_store(
                 message: error.message,
             }],
         }),
-        // 防御分支：evaluator 契约保证 result/error 至少有一个；真出现时按 error 呈现而非 panic
         (None, None) => Ok(ExportOutput {
             schema: PROTOCOL_SCHEMA,
             action: Action::Error,
@@ -178,7 +143,6 @@ pub fn export_with_store(
     }
 }
 
-/// 未授权（或在 evaluation 期间发生内容变化）的 RC 统一返回安全的空 patch。
 fn blocked_output(rc_path: &Path) -> ExportOutput {
     ExportOutput {
         schema: PROTOCOL_SCHEMA,
@@ -204,7 +168,6 @@ mod tests {
 
     use pwdir_protocol::RC_FILENAME;
 
-    /// pwsh 可用性只探测一次（spawn pwsh 成本高）。
     static PWSH_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
     fn ensure_pwsh() {
@@ -223,7 +186,6 @@ mod tests {
         );
     }
 
-    /// 注入临时 allow/cache 目录的 store 对，不碰真实 LOCALAPPDATA。
     fn temp_stores() -> (TrustStore, CacheStore, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = TrustStore::new(tmp.path().join("allow"));
@@ -231,7 +193,6 @@ mod tests {
         (store, cache, tmp)
     }
 
-    /// 写入 `.envrc.ps1` 并返回 rc 路径。
     fn write_rc(dir: &Path, body: &str) -> PathBuf {
         let rc = dir.join(RC_FILENAME);
         fs::write(&rc, body).expect("write rc fixture");
@@ -241,7 +202,6 @@ mod tests {
     #[test]
     fn export_applies_allowed_rc_and_caches_fingerprint() {
         ensure_pwsh();
-        // 保证 baseline 里没有 PWDIR_M6_FOO，set 语义确定
         std::env::remove_var("PWDIR_M6_FOO");
         let tmp = tempfile::tempdir().expect("tempdir");
         let rc = write_rc(tmp.path(), "$env:PWDIR_M6_FOO = 'bar'");
@@ -270,13 +230,13 @@ mod tests {
             "managed_keys must contain PWDIR_M6_FOO: {:?}",
             out.managed_keys
         );
-        // M6：fingerprint 已填充且 rc_sha256 与 trust 同源
-        let fingerprint = out.fingerprint.expect("fingerprint present after M6");
+        let fingerprint = out
+            .fingerprint
+            .expect("fingerprint present after evaluation");
         assert_eq!(
             fingerprint.rc_sha256,
             crate::trust::file_sha256(&rc).expect("rc hash")
         );
-        // cache 已落盘，且能被快速路径判为「仍然新鲜」
         let entry = cache.load(&rc).expect("cache load").expect("cache entry");
         assert!(fingerprint_is_current(&entry.fingerprint, &rc));
         std::env::remove_var("PWDIR_M6_FOO");
@@ -305,7 +265,6 @@ mod tests {
 
     #[test]
     fn unavailable_cwd_yields_noop_with_diagnostic() {
-        // CLI 在 current_dir 失败时传空路径：不 panic，返回 Noop + diagnostic
         let (store, cache, _guard) = temp_stores();
         let out = export_with_store(
             Path::new(""),
@@ -333,7 +292,6 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let rc = write_rc(tmp.path(), "$env:PWDIR_M6_FOO = 'bar'");
         let (store, cache, _guard) = temp_stores();
-        // 没有 allow → blocked
 
         let out = export_with_store(
             tmp.path(),
@@ -368,7 +326,6 @@ mod tests {
         let (store, cache, _guard) = temp_stores();
         store.allow(&rc).expect("allow");
 
-        // 改一个 byte → trust 失效 → blocked（内容 hash，非 mtime）
         fs::write(&rc, "$env:PWDIR_M6_FOO = 'baz'").expect("rewrite rc");
         let out = export_with_store(
             tmp.path(),
@@ -444,7 +401,6 @@ mod tests {
             "expected the evaluation error as diagnostic: {:?}",
             out.diagnostics
         );
-        // 失败不写 cache：坏结果不能成为快速路径依据（last-known-good）
         assert!(cache.load(&rc).expect("cache load").is_none());
     }
 
@@ -454,7 +410,6 @@ mod tests {
         std::env::remove_var("PWDIR_M6_FAST");
         let tmp = tempfile::tempdir().expect("tempdir");
         let marker = tmp.path().join("marker.txt");
-        // rc 每次被执行都会以当前 UTC ticks 重写 marker —— ticks 变化即证明 evaluator 运行过
         let rc = write_rc(
             tmp.path(),
             &format!(
@@ -476,7 +431,6 @@ mod tests {
         assert_eq!(first.action, Action::Apply);
         let ticks_after_first = fs::read_to_string(&marker).expect("marker after export 1");
 
-        // 第二次（不 force）：快速路径 noop —— marker 未被重写 = evaluator 未运行
         let second = export_with_store(
             tmp.path(),
             &EvaluatorConfig::default(),
@@ -503,7 +457,6 @@ mod tests {
             "evaluator must not have re-run on the fast path"
         );
 
-        // force=true 跳过快速路径：重评估，marker 被重写
         let forced = export_with_store(
             tmp.path(),
             &EvaluatorConfig::default(),
@@ -540,7 +493,6 @@ mod tests {
         .expect("export 1");
         assert_eq!(first.action, Action::Apply);
 
-        // 预写一个「指纹与当前 rc 内容不符」的 cache 条目：快速路径必须失配 → 重新评估
         let mut entry = cache.load(&rc).expect("load").expect("entry");
         entry.fingerprint.rc_sha256 = "stale".repeat(8);
         cache.save(&entry).expect("save stale entry");
@@ -588,7 +540,6 @@ mod tests {
         .expect("export 1");
         assert!(cache.load(&rc).expect("load").is_some());
 
-        // `pwdir reload` 语义：cache 失效后，下一次 export（不 force）强制重评估
         cache.invalidate(&rc).expect("invalidate");
         assert!(cache.load(&rc).expect("load").is_none());
         let second = export_with_store(

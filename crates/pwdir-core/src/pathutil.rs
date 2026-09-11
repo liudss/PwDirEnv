@@ -1,19 +1,11 @@
-//! Windows 路径字符串规范化与比较工具。
-//!
-//! 注意：Windows 文件系统路径比较是大小写不敏感的（`C:\Foo\Bin` 与 `c:\foo\bin`
-//! 视为同一路径）。本模块不做 `Resolve-Path` 式的语义解析（路径可能不存在、是 UNC
-//! 或受网络状态影响），只做纯字符串层面的规范化（SPEC §9.3）。驱动盘符字母保留
-//! 原始 case，由比较函数统一 uppercase 后再比。
+//! Lexical Windows path comparison without filesystem resolution; nonexistent paths are valid inputs.
 
-/// 规范化 Windows 路径字符串：`/` → `\`，去除末尾分隔符（盘符根如 `C:\` 除外）。
 pub fn normalize_path_str(s: &str) -> String {
     let replaced = s.replace('/', "\\");
-    // 病态输入（全部由分隔符组成，如 `\`、`\\`）原样返回，避免被 trim 成空串
     if !replaced.is_empty() && replaced.trim_end_matches('\\').is_empty() {
         return replaced;
     }
     let trimmed = replaced.trim_end_matches('\\');
-    // `C:\` 在 trim 后只剩 `C:`，需还原末尾分隔符；UNC 根 `\\server\share` 无此问题
     let is_drive_root = matches!(trimmed.as_bytes(), [c, b':'] if c.is_ascii_alphabetic());
     if is_drive_root {
         format!("{trimmed}\\")
@@ -22,7 +14,6 @@ pub fn normalize_path_str(s: &str) -> String {
     }
 }
 
-/// Windows 语义的路径相等比较：先统一分隔符，再按 ASCII 大小写不敏感比较。
 pub fn paths_equal_ci(a: &str, b: &str) -> bool {
     normalize_path_str(a).eq_ignore_ascii_case(&normalize_path_str(b))
 }

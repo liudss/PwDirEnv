@@ -2,7 +2,10 @@
 name = "pwdir-core"
 version.workspace = true
 edition.workspace = true
-description = "PwDirEnv native core: discovery / trust / diff / fingerprint / evaluator launcher / dotenv"
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "PwDirEnv native core: discovery, trust, environment diff, cache, and evaluator launcher"
 
 [dependencies]
 pwdir-protocol = { path = "../pwdir-protocol" }

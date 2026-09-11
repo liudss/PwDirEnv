@@ -1,8 +1,3 @@
-//! M3 export 集成测试（SPEC §24.3 的 M3 子集）。
-//!
-//! spawn 真实 pwsh 走完整链路：baseline 捕获 → 发现 → trust → 隔离评估 → diff。
-//! unset 场景要求测试进程环境里真实存在待删除变量（唯一名防撞），结束后恢复。
-
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -40,7 +35,6 @@ fn config() -> EvaluatorConfig {
     }
 }
 
-/// 注入临时 allow/cache 目录的 store 对，不碰真实 LOCALAPPDATA。
 fn temp_stores() -> (TrustStore, CacheStore, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = TrustStore::new(tmp.path().join("allow"));
@@ -48,7 +42,6 @@ fn temp_stores() -> (TrustStore, CacheStore, tempfile::TempDir) {
     (store, cache, tmp)
 }
 
-/// 写入 `.envrc.ps1` 并 allow，返回 rc 路径。
 fn write_and_allow(store: &TrustStore, dir: &Path, body: &str) -> std::path::PathBuf {
     let rc = dir.join(RC_FILENAME);
     fs::write(&rc, body).expect("write rc fixture");
@@ -60,7 +53,6 @@ fn write_and_allow(store: &TrustStore, dir: &Path, body: &str) -> std::path::Pat
 fn set_and_unset_in_one_rc_produce_respective_patch_sides() {
     ensure_pwsh();
     const TO_REMOVE: &str = "PWDIR_TEST_UNSET_UNIQUE_XYZ";
-    // 唯一名防撞：变量必须在 baseline（测试进程 env）里真实存在，删除才有语义
     std::env::set_var(TO_REMOVE, "1");
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -76,7 +68,6 @@ fn set_and_unset_in_one_rc_produce_respective_patch_sides() {
     let out = export_with_store(tmp.path(), &config(), &store, &cache, false)
         .expect("export must not return Err");
 
-    // 先恢复测试进程环境，再做断言（断言失败也不残留）
     std::env::remove_var(TO_REMOVE);
 
     assert_eq!(out.action, Action::Apply);
@@ -94,7 +85,6 @@ fn set_and_unset_in_one_rc_produce_respective_patch_sides() {
         "unset side must contain the removed variable: {:?}",
         out.patch.unset
     );
-    // managed_keys = set ∪ unset，两侧 key 都要出现
     assert!(out.managed_keys.iter().any(|k| k == "PWDIR_TEST_SET_FOO"));
     assert!(out.managed_keys.iter().any(|k| k == TO_REMOVE));
     assert_eq!(
@@ -106,7 +96,6 @@ fn set_and_unset_in_one_rc_produce_respective_patch_sides() {
 #[test]
 fn execution_policy_artifact_is_not_reported_as_new_var() {
     ensure_pwsh();
-    // 保证 baseline 里没有 FOO，set 语义确定
     std::env::remove_var("FOO");
     let tmp = tempfile::tempdir().expect("tempdir");
     let (store, cache, _guard) = temp_stores();
@@ -117,10 +106,6 @@ fn execution_policy_artifact_is_not_reported_as_new_var() {
     std::env::remove_var("FOO");
 
     assert_eq!(out.action, Action::Apply);
-    // `-ExecutionPolicy Bypass` 会在 evaluator pwsh 的 Process environment 里写入
-    // PSExecutionPolicyPreference（供子 pwsh 继承的人工产物，SPEC §7.2）。
-    // bootstrap 必须把它剔除：canonical（ASCII invariant uppercase）比对，
-    // 任何大小写形态的该 key 都不得出现在 set 侧。
     assert!(
         !out.patch
             .set
@@ -129,7 +114,6 @@ fn execution_policy_artifact_is_not_reported_as_new_var() {
         "PSExecutionPolicyPreference artifact must not appear on the set side: {:?}",
         out.patch.set
     );
-    // managed_keys（set ∪ unset）同样不得包含该人工产物
     assert!(
         !out.managed_keys
             .iter()
@@ -137,7 +121,6 @@ fn execution_policy_artifact_is_not_reported_as_new_var() {
         "managed_keys must not contain the policy artifact: {:?}",
         out.managed_keys
     );
-    // RC 真正设置的变量正常上报
     assert_eq!(
         out.patch.set.get("FOO").map(String::as_str),
         Some("bar"),

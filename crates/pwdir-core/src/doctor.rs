@@ -1,9 +1,4 @@
-//! doctor 环境自检（M7，SPEC §14.8）。
-//!
-//! 原则：**单项失败不中断**——每项检查内部 catch 自己的错误并降级为 Warn/Fail，
-//! `diagnose()` 永不 panic、永不向上传播错误。检查覆盖：
-//! OS/pwsh 存在性、PowerShell 版本（目标 ≥ 7.2）、module 安装、profile hook、
-//! 数据目录可写性、temp 目录、ExecutionPolicy、长路径注册表开关。
+//! Installation diagnostics. Each check reports its own failure; warnings do not make the overall result fail.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +8,6 @@ use serde::Serialize;
 
 use crate::dirs;
 
-/// 单项诊断结果。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Check {
     pub name: String,
@@ -21,7 +15,6 @@ pub struct Check {
     pub message: String,
 }
 
-/// 检查结论。`Warn` 不影响 `all_ok`，只有 `Fail` 会让 doctor 以非 0 退出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
@@ -31,7 +24,6 @@ pub enum CheckStatus {
 }
 
 impl CheckStatus {
-    /// 人类可读 / CLI 标签形态（`[OK]` / `[WARN]` / `[FAIL]` 用大写另行格式化）。
     pub fn as_str(self) -> &'static str {
         match self {
             CheckStatus::Ok => "ok",
@@ -41,16 +33,13 @@ impl CheckStatus {
     }
 }
 
-/// 全部没有 Fail 项即视为环境可用（Warn 只是提示，不阻断）。
 pub fn is_all_ok(checks: &[Check]) -> bool {
     !checks.iter().any(|c| matches!(c.status, CheckStatus::Fail))
 }
 
-/// 运行全部诊断项。任何单项的内部失败都被该项自身吸收为 Warn/Fail。
 pub fn diagnose() -> Vec<Check> {
     let mut checks = Vec::with_capacity(9);
     checks.push(check_os());
-    // pwsh 版本只探测一次，供 pwsh 存在性与版本两项检查共用（每次 spawn pwsh ≈ 0.5s）
     let version = pwsh_version();
     checks.push(check_pwsh(&version));
     checks.push(check_powershell_version(&version));
@@ -63,12 +52,6 @@ pub fn diagnose() -> Vec<Check> {
     checks
 }
 
-// ---------------------------------------------------------------------------
-// 内部工具
-// ---------------------------------------------------------------------------
-
-/// 运行外部命令并返回成功时的 stdout（trim 后）。失败 / 非 0 退出 → None。
-/// stdin 显式置 null：防止诊断命令意外等待输入挂起。
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(program)
         .args(args)
@@ -82,7 +65,6 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
     }
 }
 
-/// 探测目录可写性：写入 + 删除探针文件。探针名带 pid+纳秒避免并发 doctor 互相覆盖。
 fn dir_is_writable(dir: &Path) -> bool {
     let probe = dir.join(format!(
         ".pwdir-doctor-probe-{}",
@@ -97,7 +79,6 @@ fn dir_is_writable(dir: &Path) -> bool {
     }
 }
 
-/// 查询 pwsh 版本字符串；Err 携带面向用户的诊断句。
 fn pwsh_version() -> Result<String, String> {
     match command_output(
         "pwsh",
@@ -117,13 +98,6 @@ fn pwsh_version() -> Result<String, String> {
     }
 }
 
-/// 定位 PwDirEnv.psd1（doctor module 检查与 `pwdir hook` 共用），按顺序探测：
-/// 1. `<exe_dir>\modules\PwDirEnv\` —— 平铺布局（pwdir.exe 与 modules\ 同目录）；
-/// 2. `<exe_dir>\..\modules\PwDirEnv\` —— **packaging/install.ps1 的标准布局**
-///    （`<InstallRoot>\bin\pwdir.exe` 与 `<InstallRoot>\modules\` 是兄弟目录）；
-/// 3. `<exe_dir>\..\..\powershell\PwDirEnv\` —— 开发布局（pwdir.exe 在 target\debug 下）。
-///
-/// 返回的路径已做词法清理（无 `..` 残留），可直接用于展示与生成 hook 片段。
 pub fn module_manifest_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
@@ -138,9 +112,6 @@ pub fn module_manifest_path() -> Option<PathBuf> {
         .map(|p| lexical_clean(&p))
 }
 
-/// 词法清理路径中的 `.` / `..` 组件。不用 `fs::canonicalize`：它会解析 symlink
-/// 并追加 `\\?\` verbatim 前缀，展示与互操作都不友好；这里只是纯字符串层净化。
-/// `..` 只在栈顶为普通组件时回退（前缀/根目录不回退，防御畸形输入）。
 fn lexical_clean(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
@@ -160,12 +131,6 @@ fn lexical_clean(path: &Path) -> PathBuf {
     out
 }
 
-/// 通过 pwsh 查询 `$PROFILE.CurrentUserAllHosts`（`pwdir hook install` 的默认
-/// 目标，doctor 的 profile-hook 检查共用）。查询失败 / 输出为空 → None。
-///
-/// 注意查询的是属性本身：`$PROFILE.CurrentUserAllHosts` 已经是路径字符串
-/// （实测 pwsh 7.6），再取 `.Path` 会得到 null（空输出）——不能按直觉写
-/// `$PROFILE.CurrentUserAllHosts.Path`。
 pub fn current_user_all_hosts_profile() -> Option<PathBuf> {
     let raw = command_output(
         "pwsh",
@@ -183,14 +148,8 @@ pub fn current_user_all_hosts_profile() -> Option<PathBuf> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 各检查项
-// ---------------------------------------------------------------------------
-
 fn check_os() -> Check {
     let base = format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH);
-    // Windows 上 best-effort 追加 registry 版本号（Win10 20H2+ / Win11 的 DisplayVersion）；
-    // 读不到（旧系统 / 非管理员受限）不构成任何失败
     #[cfg(windows)]
     if let Some(out) = command_output(
         "reg.exe",
@@ -247,13 +206,11 @@ fn check_powershell_version(version: &Result<String, String>) -> Check {
     let major = v.split('.').next().and_then(|p| p.parse::<u32>().ok());
     let minor = v.split('.').nth(1).and_then(|p| p.parse::<u32>().ok());
     match (major, minor) {
-        // Windows PowerShell 5.1 明确不支持（SPEC §24.5）
         (Some(m), _) if m < 7 => Check {
             name: name.to_string(),
             status: CheckStatus::Fail,
             message: format!("PowerShell {v} is not supported; PwDirEnv requires PowerShell 7.2+"),
         },
-        // 7.0/7.1 可运行但低于目标版本（SPEC §14.8：目标 >= 7.2）
         (Some(7), Some(mi)) if mi < 2 => Check {
             name: name.to_string(),
             status: CheckStatus::Warn,
@@ -291,7 +248,6 @@ fn check_module() -> Check {
 
 fn check_profile_hook() -> Check {
     let name = "profile-hook";
-    // CurrentUserAllHosts = `profile.ps1`：对 pwsh 全部 host 生效的持久化 hook 位置
     let Some(path) = current_user_all_hosts_profile() else {
         return Check {
             name: name.to_string(),
@@ -340,7 +296,6 @@ fn check_localappdata() -> Check {
             message: format!("cannot resolve PwDirEnv data root: {e}"),
         },
         Ok(root) => {
-            // 逐个子目录写删探针：trust/cache/state 任一不可写都会破坏核心功能
             for sub in ["allow", "cache", "state"] {
                 let dir = root.join(sub);
                 if !dir_is_writable(&dir) {
@@ -410,17 +365,12 @@ fn check_execution_policy() -> Check {
         "Restricted" | "AllSigned" => Check {
             name: name.to_string(),
             status: CheckStatus::Warn,
-            // evaluator 用 `-ExecutionPolicy Bypass` 启动，仅作用于自身进程，
-            // 不修改 Machine/User policy（SPEC §7.2）；但更严格的 Machine/User
-            // 级策略可能覆盖进程级 Bypass —— 此时需管理员处理
             message: format!(
                 "execution policy (Process scope) is {policy}; the evaluator still runs with \
                  -ExecutionPolicy Bypass in its own process, but stricter Machine/User policy \
                  may override it"
             ),
         },
-        // Undefined = Process scope 未显式设置，生效策略由其它 scope 决定；
-        // evaluator 自带 -ExecutionPolicy Bypass 参数，此状态不构成阻断
         other => Check {
             name: name.to_string(),
             status: CheckStatus::Ok,
@@ -451,7 +401,6 @@ fn check_long_path() -> Check {
                 message: "cannot read LongPathsEnabled from the registry".to_string(),
             };
         };
-        // reg 输出形如 "    LongPathsEnabled    REG_DWORD    0x1"：取行内最后 token 按 hex 解析
         let value = out
             .lines()
             .find(|l| l.contains("LongPathsEnabled"))
@@ -494,7 +443,6 @@ mod tests {
     #[test]
     fn diagnose_returns_core_checks_without_panicking() {
         let checks = diagnose();
-        // 至少包含 SPEC §14.8 的核心三项；全部检查都有非空 name/message
         for required in ["os", "pwsh", "temp-dir"] {
             assert!(
                 checks.iter().any(|c| c.name == required),
@@ -504,7 +452,6 @@ mod tests {
         }
         assert!(checks.iter().all(|c| !c.name.is_empty()));
         assert!(checks.iter().all(|c| !c.message.is_empty()));
-        // 名字不重复
         let mut names: Vec<_> = checks.iter().map(|c| c.name.clone()).collect();
         names.sort();
         names.dedup();

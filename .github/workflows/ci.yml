@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 jobs:
@@ -29,9 +28,13 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -Command 'Import-Module ./powershell/PwDirEnv/PwDirEnv.psd1 -Force'
 
-      # TODO(M4): Pester 单元测试（本机 Pester 3.4.0 版本过旧，升级到 5.x 后启用）
-      # - name: Pester tests
-      #   shell: pwsh
-      #   run: |
-      #     Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force
-      #     Invoke-Pester ./tests -CI
+      - name: Build the CLI for end-to-end tests
+        run: cargo build --workspace
+
+      - name: PowerShell end-to-end tests
+        shell: pwsh
+        run: |
+          foreach ($test in @('smoke', 'e2e_trust', 'e2e_hook', 'e2e_path_torture')) {
+            pwsh -NoProfile -File "tests/$test.ps1"
+            if ($LASTEXITCODE -ne 0) { throw "$test failed" }
+          }

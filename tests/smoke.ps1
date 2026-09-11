@@ -1,5 +1,5 @@
 #requires -Version 7.2
-# PowerShell module 冒烟测试：Import-Module + Get-PwDirEnvStatus 断言。
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 

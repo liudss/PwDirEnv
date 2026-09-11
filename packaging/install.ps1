@@ -1,18 +1,13 @@
-#requires -Version 7.0
+#requires -Version 7.2
 <#
 .SYNOPSIS
-    PwDirEnv 安装脚本（M7）：构建 + 组装 dist 布局 + 拷贝到 InstallRoot。
-
+    Build and install PwDirEnv for the current user.
 .DESCRIPTION
-    - 默认安装到 $env:LOCALAPPDATA\Programs\PwDirEnv；
-    - -SkipBuild 跳过 `cargo build --release`（使用现有 target\release 产物）；
-    - 标准布局（winget 友好，pwdir doctor 的 module 检查按此布局探测）：
-        <InstallRoot>\bin\pwdir.exe
-        <InstallRoot>\modules\PwDirEnv\PwDirEnv.psd1
-        <InstallRoot>\modules\PwDirEnv\PwDirEnv.psm1
-        <InstallRoot>\skills\pwdirenv\SKILL.md   # Agent Skills 格式配套技能
-    - 不自动修改系统/用户 PATH —— 只打印后续步骤，由用户决定（最小侵入）。
+    Assemble dist/pwdir and copy the executable, module, skill, license, and docs
+    to InstallRoot. PATH and profiles are not changed. SkipBuild reuses the
+    existing release executable.
 #>
+
 param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\PwDirEnv'),
     [switch]$SkipBuild
@@ -37,7 +32,6 @@ if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
     throw "pwdir.exe not found at $exe — build first (run without -SkipBuild)"
 }
 
-# ---- 1) 组装 dist\pwdir 标准布局 -----------------------------------------
 $distBin = Join-Path $repoRoot 'dist\pwdir\bin'
 $distModule = Join-Path $repoRoot 'dist\pwdir\modules\PwDirEnv'
 $distSkillsRoot = Join-Path $repoRoot 'dist\pwdir\skills'
@@ -50,7 +44,6 @@ if (Test-Path -LiteralPath (Join-Path $skillSrcDir 'SKILL.md') -PathType Leaf) {
     Copy-Item -LiteralPath $skillSrcDir -Destination $distSkillsRoot -Recurse -Force
 }
 
-# ---- 2) 拷贝到 InstallRoot ------------------------------------------------
 $installBin = Join-Path $InstallRoot 'bin'
 $installModule = Join-Path $InstallRoot 'modules\PwDirEnv'
 $installSkillsRoot = Join-Path $InstallRoot 'skills'
@@ -63,10 +56,15 @@ if (Test-Path -LiteralPath (Join-Path $distSkillDir 'SKILL.md') -PathType Leaf) 
     Copy-Item -LiteralPath $distSkillDir -Destination $installSkillsRoot -Recurse -Force
 }
 
-# ---- 3) 验证 + 汇报 --------------------------------------------------------
 $installedExe = Join-Path $installBin 'pwdir.exe'
 $installedPsd1 = Join-Path $installModule 'PwDirEnv.psd1'
 $installedSkill = Join-Path $installSkillsRoot 'pwdirenv\SKILL.md'
+foreach ($destination in @((Join-Path $repoRoot 'dist\pwdir'), $InstallRoot)) {
+    foreach ($document in @('LICENSE', 'README.md', 'SECURITY.md', 'CONTRIBUTING.md')) {
+        Copy-Item -LiteralPath (Join-Path $repoRoot $document) -Destination $destination -Force
+    }
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'docs') -Destination $destination -Recurse -Force
+}
 foreach ($artifact in @($installedExe, $installedPsd1, (Join-Path $installModule 'PwDirEnv.psm1'), $installedSkill)) {
     if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
         throw "installation incomplete: $artifact is missing"

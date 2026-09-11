@@ -1,8 +1,3 @@
-//! M2 evaluator 集成测试（SPEC §24.3 fixture 矩阵的 M2 子集）。
-//!
-//! 每个用例构造真实 temp 项目 + `.envrc.ps1`，spawn 真实 pwsh evaluator，
-//! 断言结构化结果。超时用例把 `EvaluatorConfig.timeout` 压到 2s 控制总时长。
-
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -12,7 +7,6 @@ use std::time::Duration;
 use pwdir_core::evaluator::{evaluate, EvaluatorConfig};
 use pwdir_protocol::{DiscoveredRc, EvaluationResult, RC_FILENAME};
 
-/// pwsh 可用性只探测一次（探测本身要 spawn pwsh，10 个用例各探一次太浪费）。
 static PWSH_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 fn ensure_pwsh() {
@@ -38,7 +32,6 @@ fn config(timeout_secs: u64) -> EvaluatorConfig {
     }
 }
 
-/// 已存在 RC 文件的项目描述（RC 内容由调用方另行写入）。
 fn proj(dir: &Path) -> DiscoveredRc {
     DiscoveredRc {
         project_root: dir.to_path_buf(),
@@ -46,14 +39,12 @@ fn proj(dir: &Path) -> DiscoveredRc {
     }
 }
 
-/// 写入 `.envrc.ps1` 并返回项目描述。
 fn write_rc(dir: &Path, body: &str) -> DiscoveredRc {
     let rc = proj(dir);
     fs::write(&rc.rc_path, body).expect("write .envrc.ps1 fixture");
     rc
 }
 
-/// 按 canonical（大小写不敏感）名称查询 resulting environment 中的变量。
 fn env_of<'a>(result: &'a EvaluationResult, name: &str) -> Option<std::borrow::Cow<'a, str>> {
     result
         .environment
@@ -100,7 +91,6 @@ fn removes_env_var() {
         "Remove-Item Env:PWDIRENV_TEST_LEGACY -ErrorAction Ignore",
     );
 
-    // 变量必须在继承环境里真实存在，删除才有语义
     std::env::set_var("PWDIRENV_TEST_LEGACY", "doomed");
 
     let report = evaluate(&config(15), &rc).expect("evaluate ok");
@@ -169,7 +159,6 @@ fn write_output_noise_does_not_break_protocol() {
     let report = evaluate(&config(15), &rc).expect("evaluate ok");
     let result = expect_ok(&report);
     assert_eq!(env_of(&result, "FOO").as_deref(), Some("bar"));
-    // stdout 保留噪音，但不进协议通道
     assert!(report.stdout.contains("noise1"));
     assert!(report.stdout.contains("noise3"));
 }
@@ -183,7 +172,6 @@ fn write_host_noise_does_not_break_protocol() {
     let report = evaluate(&config(15), &rc).expect("evaluate ok");
     let result = expect_ok(&report);
     assert_eq!(env_of(&result, "FOO").as_deref(), Some("bar"));
-    // pwsh 7 在重定向模式下 Write-Host 走 stdout（Information 流重定向）
     assert!(
         report.stdout.contains("hello host") || report.stderr.contains("hello host"),
         "host noise must land on a diagnostic channel"

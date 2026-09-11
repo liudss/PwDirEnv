@@ -2,6 +2,9 @@
 name = "pwdir-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
 description = "PwDirEnv CLI (pwdir.exe): argument parsing and command routing"
 
 [[bin]]
