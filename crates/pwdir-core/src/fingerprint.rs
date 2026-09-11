@@ -6,6 +6,7 @@
 //! 宁可多评估一次，绝不漏掉一次变化（恢复正确性 > 性能）。
 
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -19,10 +20,15 @@ use crate::trust;
 /// metadata 或 mtime 获取失败返回 `None`；调用方把 `None` 视为「变了」，
 /// 快速路径据此整体失效、退回完整 evaluation。
 pub fn file_state(path: &Path) -> Option<FileFingerprint> {
-    let meta = fs::metadata(path).ok()?;
+    read_file_state(path).ok()
+}
+
+// 保留错误类型：只有 NotFound 能与缺失哨兵匹配，权限或非法路径错误必须失效。
+fn read_file_state(path: &Path) -> io::Result<FileFingerprint> {
+    let meta = fs::metadata(path)?;
     let size = meta.len();
-    let modified: Option<SystemTime> = meta.modified().ok();
-    Some(FileFingerprint {
+    let modified: Option<SystemTime> = Some(meta.modified()?);
+    Ok(FileFingerprint {
         path: path.to_path_buf(),
         size,
         modified,
@@ -124,9 +130,13 @@ pub fn fingerprint_is_current(cached: &Fingerprint, rc: &Path) -> bool {
 
 /// 当前状态是否与缓存记录一致；缺失仅与缺失哨兵相容。
 fn state_matches(expected: &FileFingerprint, path: &Path) -> bool {
-    match file_state(path) {
-        Some(current) => current.size == expected.size && current.modified == expected.modified,
-        None => expected.size == 0 && expected.modified.is_none(),
+    match read_file_state(path) {
+        Ok(current) => current.size == expected.size && current.modified == expected.modified,
+        Err(error) => {
+            error.kind() == io::ErrorKind::NotFound
+                && expected.size == 0
+                && expected.modified.is_none()
+        }
     }
 }
 
@@ -188,6 +198,29 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ghost = tmp.path().join("does-not-exist.txt");
         assert!(file_state(&ghost).is_none());
+    }
+
+    #[test]
+    fn invalid_watch_path_never_matches_missing_sentinel() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rc = write_file(tmp.path(), RC_FILENAME, "content");
+        let invalid = tmp.path().join("invalid\0path");
+        let fingerprint = compute(
+            &rc,
+            &sample_result(vec![WatchDependency::File(invalid)], vec![]),
+        );
+        assert!(!fingerprint_is_current(&fingerprint, &rc));
+    }
+
+    #[test]
+    fn missing_sourced_file_never_matches_missing_sentinel() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rc = write_file(tmp.path(), RC_FILENAME, "content");
+        let fingerprint = compute(
+            &rc,
+            &sample_result(vec![], vec![tmp.path().join("missing.ps1")]),
+        );
+        assert!(!fingerprint_is_current(&fingerprint, &rc));
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! export 编排（M3 + M6，SPEC §14.7/§12.5）：`pwdir export --format json` 的核心协议入口。
 //!
 //! 流程（严格顺序）：
-//! 1. 捕获 baseline = `EnvironmentSnapshot::from_process()` —— pwdir.exe 是 Host pwsh 的
-//!    直接子进程，其继承环境即 Host 当前环境，与 evaluator 继承的一致（SPEC §8.1/§7.3）；
+//! 1. 延迟到完整评估前捕获 baseline；无 RC、blocked 和缓存命中无需复制环境。
+//!    pwdir.exe 继承的环境与 evaluator 一致（SPEC §8.1/§7.3）；
 //! 2. 向上发现 RC：无 RC → `Noop`（module 自己判断要不要 unload 旧环境）；
 //! 3. 有 RC → trust 校验：未授权 → `Blocked`（patch 恒为空，RC 内容绝不执行）；
 //! 4. 已授权 → **fingerprint 快速路径（M6）**：未传 force 且磁盘 cache 的指纹仍与当前
@@ -49,9 +49,6 @@ pub fn export_with_store(
     cache: &CacheStore,
     force: bool,
 ) -> Result<ExportOutput, PwDirError> {
-    // 1. baseline：export 时点进程 env（与 evaluator 继承的一致）
-    let baseline = EnvironmentSnapshot::from_process();
-
     // cwd 不可用（目录被删除，CLI 传空路径）时不 panic：按无 RC 处理并给 diagnostic（SPEC §20.4）
     if cwd.as_os_str().is_empty() {
         return Ok(ExportOutput {
@@ -108,6 +105,8 @@ pub fn export_with_store(
     }
 
     // 5. 隔离评估。Err（基础设施故障）直接向上传播，CLI 按退出码映射处理
+    // 只有完整评估需要 baseline，避免每次 prompt 的快速路径枚举、分配全部环境变量。
+    let baseline = EnvironmentSnapshot::from_process();
     let versions = evaluator::embedded_script_versions();
     let report = evaluator::evaluate(cfg, &rc)?;
 
