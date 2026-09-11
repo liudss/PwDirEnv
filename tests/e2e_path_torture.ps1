@@ -1,12 +1,19 @@
 #requires -Version 7.2
 $ErrorActionPreference = 'Stop'
-$exe = 'C:\src\PwDirEnv\target\debug\pwdir.exe'
+$repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).ProviderPath
+$exe = Join-Path $repoRoot 'target\debug\pwdir.exe'
+if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+    throw "pwdir.exe not found at $exe; run cargo build --workspace first"
+}
 function Step($m) { Write-Output "[step] $m" }
-$root = Join-Path $env:TEMP ("pwdir-dod13-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+$tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+$root = Join-Path $tempBase ("pwdir-path-test-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
-$loc = Join-Path $env:TEMP ("pwdir-dod13-loc-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+$loc = Join-Path $tempBase ("pwdir-path-data-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $loc | Out-Null
+$savedLocalAppData = $env:LOCALAPPDATA
 $env:LOCALAPPDATA = $loc
+Push-Location
 
 try {
     $proj = Join-Path $root "repo with spaces' and uni-用户 [1] `$x"
@@ -29,7 +36,7 @@ try {
     }
 
     Step 'import module'
-    Import-Module 'C:\src\PwDirEnv\powershell\PwDirEnv\PwDirEnv.psd1' -Force
+    Import-Module (Join-Path $repoRoot 'powershell\PwDirEnv\PwDirEnv.psd1') -Force
     Step 'enable'
     Enable-PwDirEnv -PwDirPath $exe | Out-Null
     Step 'hook'
@@ -45,11 +52,18 @@ try {
     if ($null -ne $env:PWDIR_DOD13) { throw "outside did not restore/remove var" }
 
     Disable-PwDirEnv | Out-Null
-    Write-Output 'DOD13 PATH-TORTURE OK'
+    Write-Output 'E2E PATH-TORTURE OK'
 }
 finally {
-    Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item $loc -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item Env:LOCALAPPDATA -ErrorAction SilentlyContinue
-    $env:LOCALAPPDATA = [Environment]::GetEnvironmentVariable('LOCALAPPDATA','User')
+    if (Get-Module PwDirEnv) { Disable-PwDirEnv | Out-Null }
+    Pop-Location
+    $env:LOCALAPPDATA = $savedLocalAppData
+    foreach ($directory in @($root, $loc)) {
+        $absolute = [IO.Path]::GetFullPath($directory)
+        $allowedPrefix = $tempBase.TrimEnd('\') + '\'
+        if (-not $absolute.StartsWith($allowedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to clean a directory outside the temporary root: $absolute"
+        }
+        Remove-Item -LiteralPath $absolute -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
