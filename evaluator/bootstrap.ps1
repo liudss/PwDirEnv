@@ -49,6 +49,7 @@ try {
 
     $script:__PwDirEnvState = @{
         ProjectRoot  = $ProjectRoot
+        CurrentSourcePath = $RcPath
         Watches      = @()
         SourcedFiles = @()
     }

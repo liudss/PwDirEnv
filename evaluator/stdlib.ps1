@@ -302,7 +302,14 @@ function source_env {
         throw "source_env: file not found: $Path (resolved to $absolute)"
     }
 
-    . (Get-Item -LiteralPath $absolute).FullName
+    $previousSource = $script:__PwDirEnvState.CurrentSourcePath
+    $script:__PwDirEnvState.CurrentSourcePath = $absolute
+    try {
+        . (Get-Item -LiteralPath $absolute).FullName
+    }
+    finally {
+        $script:__PwDirEnvState.CurrentSourcePath = $previousSource
+    }
     Add-PwDirWatch -Path $absolute -Kind 'file'
     Add-PwDirSourcedFile -Path $absolute
 }
@@ -310,14 +317,19 @@ function source_env {
 function source_up {
     <#
     .SYNOPSIS
-        Source the nearest matching file strictly above ProjectRoot. No match is a no-op.
+        Source the nearest matching file strictly above the current source directory. No match is a no-op.
     #>
 
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $false, Position = 0)][string]$FileName = '.envrc.ps1'
     )
-    $dir = [IO.Path]::GetDirectoryName([string]$script:__PwDirEnvState.ProjectRoot)
+    $sourceDir = if ($script:__PwDirEnvState.CurrentSourcePath) {
+        [IO.Path]::GetDirectoryName([string]$script:__PwDirEnvState.CurrentSourcePath)
+    } else {
+        [string]$script:__PwDirEnvState.ProjectRoot
+    }
+    $dir = [IO.Path]::GetDirectoryName($sourceDir)
     while (-not [string]::IsNullOrEmpty($dir)) {
         $candidate = Join-Path -Path $dir -ChildPath $FileName
         if (Test-Path -LiteralPath $candidate -PathType Leaf) {

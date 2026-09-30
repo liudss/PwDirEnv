@@ -51,7 +51,7 @@ try {
 
     Set-Location -LiteralPath $dirOut
 
-    function global:prompt { 'my> ' }
+    function global:prompt { $global:PwDirTestPromptExitCode = $global:LASTEXITCODE; 'my> ' }
 
     Import-Module (Join-Path $repoRoot 'powershell\PwDirEnv\PwDirEnv.psd1') -Force
     Enable-PwDirEnv -PwDirPath $pwdir
@@ -61,6 +61,14 @@ try {
     if (-not $status.Enabled) { throw 'status.Enabled should be true after Enable' }
     if ($status.PwDirExe -ne $pwdir) { throw "status.PwDirExe mismatch: $($status.PwDirExe)" }
     Write-Ok 'prompt preserved after Enable-PwDirEnv; status.Enabled=true'
+    foreach ($code in @(42, 0, 7)) {
+        & pwsh -NoProfile -Command "exit $code"
+        $rendered = prompt
+        if ($rendered -ne 'my> ') { throw 'prompt output changed' }
+        if ($global:PwDirTestPromptExitCode -ne $code) { throw 'original prompt saw the wrong exit code' }
+        if ($global:LASTEXITCODE -ne $code) { throw 'prompt overwrote the last command exit code' }
+    }
+    Write-Ok 'prompt preserves native exit codes for the original prompt and subsequent commands'
 
     Invoke-PwDirEnvHook
     if ($null -ne $env:PWDIR_E2E) { throw "step a: PWDIR_E2E should be absent, got '$($env:PWDIR_E2E)'" }

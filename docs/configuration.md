@@ -26,7 +26,7 @@ differences are applied to the host.
 | `watch_file PATH...` | Register size/mtime dependencies, including files that do not exist yet. |
 | `watch_dir PATH...` | Watch directory metadata, not recursive content. |
 | `source_env PATH` | Dot-source a script in the evaluator and record its dependency; fail if missing. |
-| `source_up [FILENAME]` | Source the nearest matching file above the project root; default `.envrc.ps1`; no match is a no-op. |
+| `source_up [FILENAME]` | Source the nearest matching file above the current RC or sourced script; nested calls continue upward; default `.envrc.ps1`; no match is a no-op. |
 
 Dotenv helpers do **not** register watches automatically: use `watch_file`.
 Direct PowerShell reads are also untracked. Source helpers do not perform

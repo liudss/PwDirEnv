@@ -388,8 +388,14 @@ function Enable-PwDirEnv {
     }
 
     function global:prompt {
+        $__pwdirLastExitCode = Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly -ErrorAction Ignore
         $__pwdirWrapper = $script:PromptMarker
-        Invoke-PwDirEnvHook
+        try {
+            Invoke-PwDirEnvHook
+        }
+        finally {
+            $global:LASTEXITCODE = $__pwdirLastExitCode
+        }
         if ($null -ne $script:PwDirState.OriginalPrompt) {
             & $script:PwDirState.OriginalPrompt
         }

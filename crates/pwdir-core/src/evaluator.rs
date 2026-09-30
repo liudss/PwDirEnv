@@ -308,7 +308,11 @@ fn fallback_error(timed_out: bool, exit_code: Option<i32>, stderr: &str) -> Eval
     }
     let hint = stderr.lines().rev().find(|l| !l.trim().is_empty());
     let hint = hint.map(|l| l.trim()).unwrap_or_default();
-    let hint = if hint.len() > 200 { &hint[..200] } else { hint };
+    let mut end = hint.len().min(200);
+    while !hint.is_char_boundary(end) {
+        end -= 1;
+    }
+    let hint = &hint[..end];
     EvaluationError {
         kind: "no-result".to_string(),
         message: format!(

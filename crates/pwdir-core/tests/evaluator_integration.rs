@@ -249,3 +249,21 @@ fn project_root_with_spaces() {
     let result = expect_ok(&report);
     assert_eq!(env_of(&result, "FOO").as_deref(), Some("bar"));
 }
+
+#[test]
+fn missing_result_with_long_unicode_stderr_is_reported_without_panic() {
+    ensure_pwsh();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let rc = write_rc(
+        tmp.path(),
+        "[Console]::Error.WriteLine(('错误信息' * 100)); [Environment]::Exit(7)",
+    );
+    let report = evaluate(&config(15), &rc).expect("evaluate");
+    assert!(report.result.is_none());
+    assert_eq!(report.exit_code, Some(7));
+    let error = report.error.expect("structured fallback error");
+    assert_eq!(error.kind, "no-result");
+    assert!(error
+        .message
+        .ends_with(&"错误信息".repeat(100).chars().take(66).collect::<String>()));
+}

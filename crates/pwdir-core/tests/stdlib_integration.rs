@@ -346,3 +346,50 @@ fn source_up_without_parent_rc_is_noop() {
     assert!(result.sourced_files.is_empty());
     assert!(result.watches.is_empty());
 }
+
+#[test]
+fn source_up_chain_loads_each_ancestor_once_and_restores_context() {
+    ensure_pwsh();
+    let tmp = temp_project();
+    let parent = tmp.path().join("parent");
+    let child = parent.join("child");
+    fs::create_dir_all(&child).expect("mkdirs");
+    let grandparent_rc = write_rc(tmp.path(), "$env:PW_CHAIN += 'G'");
+    let parent_rc = write_rc(&parent, "$env:PW_CHAIN += 'P'; if ($env:PW_CHAIN.Length -gt 4) { throw 'recursive source_up' }; source_up");
+    fs::write(parent.join("extra.ps1"), "$env:PW_CHAIN += 'E'").expect("extra source");
+    let rc = write_rc(
+        &child,
+        "$env:PW_CHAIN = 'C'; source_up; source_up 'extra.ps1'",
+    );
+    let report = evaluate(&config(15), &rc).expect("evaluate");
+    let result = expect_ok(&report);
+    assert_eq!(env_of(&result, "PW_CHAIN").as_deref(), Some("CPGE"));
+    let expected = vec![
+        grandparent_rc.rc_path,
+        parent_rc.rc_path,
+        parent.join("extra.ps1"),
+    ];
+    assert_eq!(result.sourced_files, expected);
+    assert_eq!(
+        result.watches,
+        expected
+            .into_iter()
+            .map(WatchDependency::File)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn source_up_restores_context_after_caught_source_error() {
+    ensure_pwsh();
+    let tmp = temp_project();
+    let child = tmp.path().join("child");
+    fs::create_dir(&child).expect("mkdir child");
+    fs::write(tmp.path().join("broken.ps1"), "throw 'expected'").expect("broken source");
+    let parent_rc = write_rc(tmp.path(), "$env:PW_RECOVERED = 'yes'");
+    let rc = write_rc(&child, "try { source_up 'broken.ps1' } catch {}; source_up");
+    let report = evaluate(&config(15), &rc).expect("evaluate");
+    let result = expect_ok(&report);
+    assert_eq!(env_of(&result, "PW_RECOVERED").as_deref(), Some("yes"));
+    assert_eq!(result.sourced_files, vec![parent_rc.rc_path]);
+}

@@ -329,3 +329,36 @@ fn exec_outcome_default_is_empty() {
     assert!(outcome.stdout.is_empty());
     assert!(outcome.stderr.is_empty());
 }
+
+#[test]
+fn exec_resolves_relative_project_and_parent_rc() {
+    ensure_pwsh();
+    let cwd = std::env::current_dir().expect("cwd");
+    let tmp = tempfile::tempdir_in(&cwd).expect("local fixture");
+    let project = tmp.path().join("project");
+    let child = project.join("child");
+    fs::create_dir_all(&child).expect("mkdir child");
+    let rc = write_rc(&project, "$env:PW_EXEC_RELATIVE = 'resolved'");
+    let (store, _guard) = temp_store();
+    store.allow(&rc).expect("allow fixture");
+    for dir in [&project, &child] {
+        let relative = Path::new(".").join(dir.strip_prefix(&cwd).expect("relative path"));
+        let outcome = run_exec_with_store(
+            &relative,
+            "pwsh",
+            &strings(&[
+                "-NoProfile",
+                "-Command",
+                "Write-Output $env:PW_EXEC_RELATIVE; (Get-Location).ProviderPath; exit 42",
+            ]),
+            true,
+            &EvaluatorConfig::default(),
+            &store,
+        )
+        .expect("relative exec succeeds");
+        assert_eq!(outcome.exit_code, Some(42));
+        let lines: Vec<_> = outcome.stdout.lines().collect();
+        assert_eq!(lines[0], "resolved");
+        assert_eq!(Path::new(lines[1]), dir);
+    }
+}

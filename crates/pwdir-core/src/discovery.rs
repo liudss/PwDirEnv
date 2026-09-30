@@ -7,7 +7,10 @@ use pwdir_protocol::{DiscoveredRc, RC_FILENAME};
 use crate::PwDirError;
 
 pub fn find_rc(start: &Path) -> Result<Option<DiscoveredRc>, PwDirError> {
-    let mut dir = start;
+    // Resolve before the evaluator changes directory, without requiring the
+    // starting path to exist or resolving symlinks.
+    let start = std::path::absolute(start)?;
+    let mut dir = start.as_path();
     loop {
         let candidate = dir.join(RC_FILENAME);
         if candidate.is_file() {

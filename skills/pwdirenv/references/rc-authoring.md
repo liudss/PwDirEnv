@@ -19,7 +19,7 @@ watch_file '.env.local'
 | `watch_file PATH...` | Track size/mtime, including not-yet-created files. |
 | `watch_dir PATH...` | Directory metadata only, not recursive content. |
 | `source_env PATH` | Source and track a script; fail if absent. No separate approval check. |
-| `source_up [FILENAME]` | Nearest matching ancestor above project root; default `.envrc.ps1`; no match is a no-op. |
+| `source_up [FILENAME]` | Nearest matching ancestor above the current RC or sourced script; nested calls continue upward; default `.envrc.ps1`; no match is a no-op. |
 
 Dotenv does not watch automatically. Explicit PowerShell reads need watches too.
 Dotenv accepts UTF-8/BOM, optional lowercase `export`, literal single quotes,
