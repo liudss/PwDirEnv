@@ -2,39 +2,103 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+  workflow_call:
+  schedule:
+    - cron: '23 4 * * 1'
+
+permissions:
+  contents: read
 
 jobs:
   windows:
+    name: Windows tests
     runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable (clippy + fmt)
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
           components: clippy, rustfmt
-
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: cargo test
-        run: cargo test --workspace
-
-      - name: PowerShell module import smoke
-        shell: pwsh
-        run: pwsh -NoProfile -Command 'Import-Module ./powershell/PwDirEnv/PwDirEnv.psd1 -Force'
-
-      - name: Build the CLI for end-to-end tests
-        run: cargo build --workspace
-
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --locked
       - name: PowerShell end-to-end tests
-        shell: pwsh
         run: |
           foreach ($test in @('smoke', 'e2e_trust', 'e2e_hook', 'e2e_path_torture')) {
             pwsh -NoProfile -File "tests/$test.ps1"
             if ($LASTEXITCODE -ne 0) { throw "$test failed" }
           }
+      - name: Install Pester 5
+        run: Install-Module Pester -RequiredVersion 5.9.1 -Scope CurrentUser -Repository PSGallery -Force -ErrorAction Stop
+      - name: Pester tests (no skipped or empty runs)
+        run: pwsh -NoProfile -File tests/run-pester.ps1
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pester-results
+          path: testResults.xml
+          if-no-files-found: error
+          retention-days: 14
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Verify source installer
+        run: |
+          $installRoot = Join-Path $env:RUNNER_TEMP 'PwDirEnv-install-check'
+          ./packaging/install.ps1 -SkipBuild -InstallRoot $installRoot
+          if ($LASTEXITCODE -ne 0) { throw 'Installer failed' }
+          Import-Module (Join-Path $installRoot 'modules/PwDirEnv/PwDirEnv.psd1') -Force
+          $installed = Join-Path $installRoot 'bin/pwdir.exe'
+          if ((Get-FileHash $installed).Hash -ne (Get-FileHash target/release/pwdir.exe).Hash) {
+            throw 'Installed executable differs from the release build'
+          }
+          & $installed --version
+          if ($LASTEXITCODE -ne 0) { throw 'Installed executable failed' }
+
+  dependencies:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          arguments: --locked --all-features
+          command: check
+          command-arguments: advisories licenses bans sources
+
+  secrets:
+    name: Full-history secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl --fail --location --retry 3 "$base/$archive" -o "$RUNNER_TEMP/$archive"
+          curl --fail --location --retry 3 "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt" -o "$RUNNER_TEMP/checksums.txt"
+          (cd "$RUNNER_TEMP"; grep " $archive$" checksums.txt | sha256sum --check --strict)
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+      - name: Scan every fetched branch and tag
+        run: '"$RUNNER_TEMP/gitleaks" git --log-opts="--all" --redact --no-banner .'

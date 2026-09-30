@@ -1,0 +1,42 @@
+name: Draft preview release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+  draft:
+    name: Create source release draft
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check tag against Cargo and module versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, tomllib
+          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version']
+          manifest = pathlib.Path('powershell/PwDirEnv/PwDirEnv.psd1').read_text()
+          module_version = re.search(r"ModuleVersion\s*=\s*'([^']+)'", manifest).group(1)
+          if os.environ['RELEASE_TAG'] != f'v{version}' or module_version != version:
+              raise SystemExit('Tag, Cargo version and PowerShell ModuleVersion must agree')
+          PY
+      - name: Create draft (maintainer reviews and publishes on GitHub)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" --verify-tag --draft --prerelease \
+            --title "PwDirEnv $RELEASE_TAG — preview" --generate-notes

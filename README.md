@@ -6,7 +6,7 @@ PwDirEnv loads an approved `.envrc.ps1` when you enter a project and restores
 the environment when you leave. Configuration runs in a separate PowerShell
 process; only environment-variable changes return to your shell.
 
-**Status: early preview for local testing.** Windows and PowerShell 7.2+ are
+**Status: early preview.** Windows and PowerShell 7.2+ are
 the intended platform. There is no published winget package or measured
 performance guarantee. See [known limitations](docs/limitations.md).
 
@@ -77,6 +77,17 @@ current session. `Enable-PwDirEnv` turns the hook back on.
 - [Architecture decisions](docs/adr/README.md)
 - [Contributing and testing](CONTRIBUTING.md)
 - [Agent skill](skills/pwdirenv/SKILL.md)
+
+## Feedback and contributions
+
+Use [GitHub Issues](https://github.com/liudss/PwDirEnv/issues) for bugs,
+questions, and feature requests, and [Pull Requests](https://github.com/liudss/PwDirEnv/pulls)
+for changes. See [CONTRIBUTING.md](CONTRIBUTING.md) for checks and review expectations.
+For vulnerabilities, follow [SECURITY.md](SECURITY.md).
+
+CI tests Windows, scans Git history for secrets, and checks dependency
+advisories and licenses. Tagged versions produce a draft source release only
+after these checks pass; see [the release process](docs/releasing.md).
 
 ## License
 

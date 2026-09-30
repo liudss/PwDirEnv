@@ -1,6 +1,6 @@
 # Known limitations and implementation audit
 
-Reviewed against the source on 2026-09-11. These are current constraints,
+Reviewed against the source on 2026-10-01. These are current constraints,
 not a development schedule.
 
 | Area | Implemented behavior and limits |
@@ -31,16 +31,22 @@ Removed claims include a Rust dotenv parser, ready-to-use winget distribution,
 measured prompt-latency guarantees, file-ID hardening, and broad compatibility
 validation. The empty Rust dotenv module was removed as misleading scaffolding.
 
-## Private local trial
+## Validation and ongoing testing
 
-Local validation for this migration used PowerShell 7.6.5 and Rust 1.98.1 on
-Windows: 139 Rust tests, Clippy with warnings denied, formatting checks, all
-four standalone PowerShell smoke/E2E scripts, and skill validation passed.
-The local Pester is 3.4.0, so the optional Pester 5 suite was not run.
+Local validation of revision `5314613` used PowerShell 7.6.6 on Windows:
+143 Rust tests, Clippy with warnings denied, formatting checks, all four
+standalone PowerShell smoke/E2E scripts, and all 11 Pester tests passed.
+The release build, installed file hashes, and `pwdir doctor` also passed.
+The GitHub CI run for that revision completed successfully.
 These results do not establish compatibility with every supported version.
 
-Check A-to-B-to-outside transitions, PATH restoration, nested shells, edits and
-denials, source dependencies, reload failures, and existing prompt tools over
-several days. Record names and sanitized errors rather than environment values.
-Run `pwdir doctor` for installation reports. Trial results should inform any
-later decision to make the repository public.
+The CI workflow now requires Pester 5, checks installation from the release
+build, scans fetched Git history with Gitleaks, and checks dependency
+advisories, licenses, and sources with cargo-deny. Weekly runs recheck the
+current tree against changing advisory data. Check the actual workflow result
+for a revision; configured checks alone are not proof that it passed.
+
+Continue testing A-to-B-to-outside transitions, PATH restoration, nested
+shells, edits and denials, source dependencies, reload failures, and existing
+prompt tools. Report reproducible problems through GitHub Issues using
+synthetic values and sanitized diagnostics. Do not post environment dumps.

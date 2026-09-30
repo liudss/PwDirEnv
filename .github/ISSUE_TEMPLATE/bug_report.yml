@@ -1,0 +1,26 @@
+name: Bug report
+description: Report a reproducible problem using synthetic data.
+body:
+  - type: markdown
+    attributes:
+      value: "For suspected vulnerabilities, use the reporting instructions in SECURITY.md. Do not post credentials, environment dumps, or raw PWDIRENV_CONTEXT."
+  - type: textarea
+    id: environment
+    attributes:
+      label: Versions
+      description: Windows, PowerShell, and pwdir versions. Redact personal paths.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal .envrc.ps1 with synthetic values, commands, and directory layout.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true

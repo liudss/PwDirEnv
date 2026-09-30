@@ -33,8 +33,18 @@ output can contain secrets; inspect diagnostics before sharing them.
 
 ## Reporting
 
-During the private preview, report suspected vulnerabilities privately to
-the repository owner through an existing private contact channel. Include
-the version, a reproduction using synthetic data, and the impact. Do not
-include credentials or real environment dumps. There is no dedicated
-security-response SLA for this preview.
+Use GitHub for security reports:
+
+1. Open [Report a vulnerability](https://github.com/liudss/PwDirEnv/security/advisories/new)
+   when GitHub private vulnerability reporting is enabled. Include the version,
+   impact, and a reproduction using synthetic data.
+2. If that form is unavailable, open a [GitHub issue](https://github.com/liudss/PwDirEnv/issues/new)
+   asking the maintainer to enable vulnerability reporting. Do not include
+   vulnerability details, exploit code, credentials, or environment dumps in
+   that public issue. Submit those details through the advisory form once enabled.
+
+The maintainer must enable private vulnerability reporting in GitHub repository
+settings when the repository becomes public. This is GitHub's confidential
+reporting channel, not a personal contact requirement. There is no guaranteed
+security-response SLA for this early preview. Fixes target the latest revision
+on `main`; older preview releases do not have separate maintenance branches.
