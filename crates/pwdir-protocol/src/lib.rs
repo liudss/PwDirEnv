@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize};
 
@@ -73,7 +73,7 @@ pub struct TrustRecord {
     pub path: PathBuf,
     pub file_id: Option<u64>,
     pub sha256: String,
-    pub allowed_at: DateTime<Utc>,
+    pub allowed_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -229,6 +229,31 @@ pub struct ExportOutput {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn trust_record_reads_existing_chrono_timestamps() {
+        for timestamp in [
+            "2026-11-23T14:50:53Z",
+            "2026-11-23T14:50:53.123Z",
+            "2026-11-23T14:50:53.123456Z",
+            "2026-11-23T14:50:53.123456789Z",
+            "2026-11-23T14:50:53.123456789+00:00",
+        ] {
+            let value = json!({
+                "schema": 1,
+                "path": "project/.envrc.ps1",
+                "file_id": null,
+                "sha256": "abc",
+                "allowed_at": timestamp,
+            });
+            let record: TrustRecord = serde_json::from_value(value).unwrap();
+            assert_eq!(record.allowed_at, timestamp.parse::<Timestamp>().unwrap());
+            let serialized = serde_json::to_value(&record).unwrap();
+            assert_eq!(serialized["allowed_at"], timestamp.replace("+00:00", "Z"));
+            let back: TrustRecord = serde_json::from_value(serialized).unwrap();
+            assert_eq!(back, record);
+        }
+    }
 
     #[test]
     fn env_key_is_case_insensitive() {

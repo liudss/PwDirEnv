@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use chrono::Utc;
+use jiff::Timestamp;
 use pwdir_protocol::{Action, Diagnostic, EnvironmentSnapshot, ExportOutput, PROTOCOL_SCHEMA};
 
 use crate::cache::{CacheEntry, CacheStore, CACHE_SCHEMA};
@@ -94,7 +94,7 @@ pub fn export_with_store(
                 schema: CACHE_SCHEMA,
                 rc: rc.rc_path.clone(),
                 fingerprint: fingerprint.clone(),
-                evaluated_at: Utc::now().to_rfc3339(),
+                evaluated_at: Timestamp::now().to_string(),
             })?;
 
             let desired = result.environment;

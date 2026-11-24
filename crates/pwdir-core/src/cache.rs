@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use pwdir_protocol::Fingerprint;
@@ -85,7 +85,7 @@ impl CacheStore {
 }
 
 pub fn now_iso8601() -> String {
-    Utc::now().to_rfc3339()
+    Timestamp::now().to_string()
 }
 
 #[cfg(test)]

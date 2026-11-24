@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use jiff::Timestamp;
 use sha2::{Digest, Sha256};
 
 use pwdir_protocol::{TrustRecord, PROTOCOL_SCHEMA};
@@ -62,7 +62,7 @@ impl TrustStore {
             path: canonical,
             file_id: None,
             sha256,
-            allowed_at: Utc::now(),
+            allowed_at: Timestamp::now(),
         };
         let payload = serde_json::to_vec_pretty(&record)?;
 
@@ -126,7 +126,7 @@ impl TrustStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use pwdir_protocol::RC_FILENAME;
 
     fn temp_store() -> (TrustStore, tempfile::TempDir) {
@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(record.sha256.len(), 64);
         assert!(record.sha256.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(record.sha256.chars().all(|c| !c.is_ascii_uppercase()));
-        assert!(record.allowed_at <= Utc::now());
+        assert!(record.allowed_at <= Timestamp::now());
         assert_eq!(record.path, store.canonical_path(&rc));
         assert!(record.file_id.is_none());
     }
